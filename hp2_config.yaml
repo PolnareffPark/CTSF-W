@@ -1,0 +1,78 @@
+# =========================
+# CTSF-W  HP2 configuration
+# =========================
+general:
+  seed: 11                                   # CFG 기본 seed
+  device: "cuda"                             # cuda if available
+  save_path: "best-CTSF-W.pt"               # best ckpt path
+  out_dir: "results"                         # result root dir
+  model_tag: "HyperConv"                     # tagging
+
+data:
+  csv_path: "datasets/ETTh2.csv"             # 예시(실험마다 교체)
+  value_cols: null                           # None -> CSV의 모든 수치형 사용
+  train_ratio: 0.6                           # split
+  val_ratio: 0.2
+  lookback: 720                              # L (window)
+  horizon: 192                               # H (예: 96/192/336/720로 바꿔 실험)
+  patch_len: 36                              # 패치 길이(프런트 패치 컨브)
+  batch_size: 128                            # 
+
+dataloader:
+  shuffle_train: true                        # train만 shuffle
+  shuffle_val: false
+  shuffle_test: false
+  drop_last: true
+  num_workers: 4
+  pin_memory: true
+
+model:
+  d_embed: 256                               # 내부 채널 차원
+  cnn_depth: 7                               # Conv/GRU/xHyperConv 블록 수
+  n_heads: 4                                 # Cross-modal attention heads
+  dropout_rate: 0.35                         # 모든 블록 공통 dropout
+  conv_kernel: 3                             # ResConvBlock kernel
+  hyperconv_k: 3                             # CrossHyperConvBlock k
+  alpha_init:
+    diag: 0.90                               # cross-stitch α 초기 diag
+    offdiag: 0.05
+  revin:
+    affine: true                             # 인스턴스 정규화 affine 사용
+
+loss:
+  criterion: "MSE + PatchStat"               # ps_loss 정의
+  lam_patch: 0.03                            # Patch-Stat 가중치(HP2)
+  # PatchStat 내부 패치 길이는 런타임에서 H로부터 계산:
+  # ps_patch_len = 8 * max(1, H // 24)       # ≈ 24-step 기준
+
+optim:
+  optimizer: "AdamW"
+  lr: 1.0e-4                                 # HP2 learning rate
+  weight_decay: 1.0e-3                       # AdamW wd
+  grad_clip: 0.5                             # clip_grad_norm 값
+
+schedule:
+  scheduler: "OneCycleLR"                    # 원본과 동일 스케줄러 사용
+  max_lr: "@optim.lr"                        # lr와 동일로 사용
+  total_steps: "@(len(train_loader) * epochs)"  # 에폭×스텝
+  pct_start: 0.15                            # 원본 세팅 유지
+  div_factor: 25.0                           # ↑
+  final_div_factor: 1.0e4                    # ↑
+  # 참고: CFG의 lr_warmup_epochs=5는 OneCycleLR 사용 시 별도 반영되지 않음(보존용)
+
+train:
+  epochs: 100                                # HP2 에폭 수
+  early_stop:
+    patience: 20                             # 조기 종료 인내심
+    min_delta: 1.0e-3                        # 클래스 기본값과 동일
+
+inference:
+  # 결과 CSV 병합 규칙(중복 정의): dataset, model, seed, horizon, depth, lam_patch, lamb_reg로 dedup 후 append
+  merge_keys: ["dataset","model","seed","horizon","depth","lam_patch","lamb_reg"]  #
+
+experiment:
+  # 재현 실험에 사용한 seed 세트(논문 표/그림용 반복 실험)
+  seeds: [42,2,3,5,7,11,13,17,19,23]         # 실험 스위트에서 사용한 목록
+  horizons: [96,192,336,720]
+  datasets: ["ETTm1","ETTm2","ETTh1","ETTh2","weather"]
+  cross_mode: "both"                         # {"both","gc_only","cg_only","none"} 토글
