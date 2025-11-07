@@ -63,17 +63,34 @@ def compute_w4_metrics(
         gru_repr = hooks_data.get("gru_representations")
         
         if cnn_repr is not None and gru_repr is not None:
-            # 활성 층의 표현만 사용
+            # cnn_repr와 gru_repr는 활성 층 순서대로 정렬된 리스트
+            # cnn_repr[idx] = 활성 층 active_layers[idx]의 표현
             similarities = []
-            for i in active_layers:
-                if i < len(cnn_repr) and i < len(gru_repr):
-                    cnn_i = cnn_repr[i] if isinstance(cnn_repr[i], np.ndarray) else np.array(cnn_repr[i])
-                    gru_i = gru_repr[i] if isinstance(gru_repr[i], np.ndarray) else np.array(gru_repr[i])
+            
+            for idx in range(len(active_layers)):
+                if idx < len(cnn_repr) and idx < len(gru_repr):
+                    cnn_i = cnn_repr[idx]
+                    gru_i = gru_repr[idx]
                     
+                    # None 체크
+                    if cnn_i is None or gru_i is None:
+                        continue
+                    
+                    # numpy 배열로 변환
+                    if not isinstance(cnn_i, np.ndarray):
+                        cnn_i = np.array(cnn_i)
+                    if not isinstance(gru_i, np.ndarray):
+                        gru_i = np.array(gru_i)
+                    
+                    # shape 확인 및 distance correlation 계산
                     if cnn_i.shape[0] == gru_i.shape[0] and cnn_i.shape[0] > 1:
-                        sim = _dcor_u(cnn_i, gru_i)
-                        if np.isfinite(sim):
-                            similarities.append(sim)
+                        try:
+                            sim = _dcor_u(cnn_i, gru_i)
+                            if np.isfinite(sim):
+                                similarities.append(sim)
+                        except Exception:
+                            # distance correlation 계산 실패 시 스킵
+                            pass
             
             if len(similarities) > 0:
                 metrics["w4_layerwise_representation_similarity"] = float(np.mean(similarities))

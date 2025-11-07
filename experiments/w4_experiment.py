@@ -12,8 +12,9 @@ class W4Experiment(BaseExperiment):
     def _create_model(self):
         model = HybridTS(self.cfg, self.n_vars)
         
+        # 모델로부터 실제 depth를 가져옴 (하드코딩 방지)
+        depth = len(model.xhconv_blks)
         cross_layers = self.cfg.get("cross_layers", "all")
-        depth = self.cfg["cnn_depth"]
         
         if cross_layers == "all":
             # 모든 층 활성화
@@ -34,6 +35,8 @@ class W4Experiment(BaseExperiment):
         else:
             raise ValueError(f"Unknown cross_layers: {cross_layers}")
         
+        # active_layers를 인스턴스 속성으로 저장 (BaseExperiment에서 재사용)
+        self.active_layers = active_layers
         model.set_cross_layers(active_layers)
         return model
     

@@ -1,5 +1,42 @@
 ## 📝 최근 변경 내역
 
+### 2025-11-07: W4 실험 코드 개선 (평가 피드백 반영)
+
+#### 1. W4Experiment 개선
+- **파일**: `experiments/w4_experiment.py`
+- **변경**: 모델로부터 실제 depth를 가져와 하드코딩 방지
+- **상세**:
+  - `depth = len(model.xhconv_blks)`로 모델 구조와 자동 동기화
+  - `self.active_layers` 속성 추가로 BaseExperiment와 정보 공유
+  - 설정 파일에 `cnn_depth` 누락/불일치 시에도 안전하게 동작
+
+#### 2. BaseExperiment W4 지원 강화
+- **파일**: `experiments/base_experiment.py`
+- **변경**: W4 실험 시 중간층 표현 자동 수집 및 중복 로직 제거
+- **상세**:
+  - `evaluate_test()`에 중간층 표현 수집 훅(hook) 추가
+  - 각 활성 층의 CNN/GRU 출력을 자동으로 수집하여 hooks_data에 저장
+  - W4 active_layers 중복 계산 제거 (W4Experiment의 속성 재사용)
+  - `w4_layerwise_representation_similarity` 지표가 정상적으로 계산됨
+
+#### 3. W4 지표 계산 로직 강화
+- **파일**: `utils/experiment_metrics/w4_metrics.py`
+- **변경**: 표현 유사도 계산 시 예외 처리 및 안정성 개선
+- **상세**:
+  - None 체크 추가로 누락된 데이터 graceful handling
+  - Distance correlation 계산 실패 시 예외 처리
+  - 데이터 구조에 대한 명확한 주석 추가
+
+#### 4. 테스트 및 문서화
+- **신규 파일**: 
+  - `test_w4_modifications.py`: W4 수정 사항 검증 테스트
+  - `W4_MODIFICATIONS_SUMMARY.md`: 상세 수정 내역 및 가이드
+- **효과**: 
+  - 코드 품질 향상 및 유지보수성 개선
+  - 실험 재현성 보장
+
+---
+
 ### 2025-01-XX: 보고용 그림 지표 및 결과 저장 구조 추가
 
 #### 1. 하이퍼파라미터 처리 개선

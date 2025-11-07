@@ -27,6 +27,7 @@ class BaseExperiment:
         self.experiment_type = cfg.get("experiment_type", "W1")
         self.start_time = None
         self.train_time = None
+        self.active_layers = None  # W4 실험에서 사용
         
         # 데이터 로딩
         self.train_loader, self.val_loader, self.test_loader, (mu_np, std_np, C) = \
@@ -140,14 +141,83 @@ class BaseExperiment:
         # W2 실험이면 게이트 출력 수집
         collect_gates = (self.experiment_type == "W2")
         
-        direct = evaluate_with_direct_evidence(
-            self.model, self.test_loader, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device,
-            collect_gate_outputs=collect_gates
-        )
+        # W4 실험이면 중간층 표현 수집을 위한 훅 등록
+        hooks_data = {}
+        hooks = []
+        if self.experiment_type == "W4" and self.active_layers:
+            # 층별로 표현을 저장할 딕셔너리 초기화
+            cnn_repr_by_layer = {i: [] for i in self.active_layers}
+            gru_repr_by_layer = {i: [] for i in self.active_layers}
+            
+            def make_hook(layer_idx, repr_dict):
+                def hook_fn(module, input, output):
+                    # output: zc or zr (T, B, d)
+                    # 전체 시퀀스를 평균하거나 마지막 표현을 사용
+                    if isinstance(output, tuple):
+                        repr_tensor = output[0]  # (T, B, d)
+                    else:
+                        repr_tensor = output  # (T, B, d)
+                    
+                    # (T, B, d) -> (B, d) 평균
+                    repr_mean = repr_tensor.mean(dim=0).detach().cpu().numpy()  # (B, d)
+                    repr_dict[layer_idx].append(repr_mean)
+                return hook_fn
+            
+            # 각 활성 층에 훅 등록
+            for i in self.active_layers:
+                if i < len(self.model.conv_blks):
+                    # CNN 경로
+                    h1 = self.model.conv_blks[i].register_forward_hook(
+                        make_hook(i, cnn_repr_by_layer)
+                    )
+                    hooks.append(h1)
+                if i < len(self.model.gru_blks):
+                    # GRU 경로
+                    h2 = self.model.gru_blks[i].register_forward_hook(
+                        make_hook(i, gru_repr_by_layer)
+                    )
+                    hooks.append(h2)
+            
+            # 나중에 hooks_data에 저장 (평가 후)
         
-        # hooks_data 추출 (W2 실험용)
-        hooks_data = direct.pop('hooks_data', None)
+        try:
+            direct = evaluate_with_direct_evidence(
+                self.model, self.test_loader, self.mu, self.std,
+                tod_vec=tod_vec, device=self.device,
+                collect_gate_outputs=collect_gates
+            )
+        finally:
+            # 훅 제거
+            for h in hooks:
+                h.remove()
+            
+            # W4: 수집된 표현을 hooks_data에 저장
+            if self.experiment_type == "W4" and self.active_layers:
+                # 각 배치의 표현을 연결하여 층별 리스트 생성
+                # cnn_repr_by_layer[i] = [batch0, batch1, ...] -> np.concatenate -> (total_samples, d)
+                import numpy as np
+                cnn_repr_list = []
+                gru_repr_list = []
+                
+                # 활성 층 순서대로 정리
+                for i in self.active_layers:
+                    if cnn_repr_by_layer[i]:
+                        cnn_repr_list.append(np.concatenate(cnn_repr_by_layer[i], axis=0))
+                    else:
+                        cnn_repr_list.append(None)
+                    
+                    if gru_repr_by_layer[i]:
+                        gru_repr_list.append(np.concatenate(gru_repr_by_layer[i], axis=0))
+                    else:
+                        gru_repr_list.append(None)
+                
+                hooks_data["cnn_representations"] = cnn_repr_list
+                hooks_data["gru_representations"] = gru_repr_list
+        
+        # hooks_data 병합 (W2 실험용 게이트 데이터)
+        w2_hooks_data = direct.pop('hooks_data', None)
+        if w2_hooks_data:
+            hooks_data.update(w2_hooks_data)
         
         # direct_evidence는 direct 자체 (성능 및 직접 근거 지표)
         direct_evidence = direct.copy()
@@ -156,25 +226,13 @@ class BaseExperiment:
         try:
             from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
             
-            # W4의 경우 active_layers 정보 필요
-            active_layers = []
-            if self.experiment_type == "W4":
-                cross_layers = self.cfg.get("cross_layers", "all")
-                depth = self.cfg.get("cnn_depth", 7)
-                if cross_layers == "all":
-                    active_layers = list(range(depth))
-                elif cross_layers == "shallow":
-                    active_layers = list(range(max(1, depth // 3)))
-                elif cross_layers == "mid":
-                    start = depth // 3
-                    active_layers = list(range(start, start + max(1, depth // 3)))
-                elif cross_layers == "deep":
-                    active_layers = list(range(depth - max(1, depth // 3), depth))
+            # W4의 경우 self.active_layers 사용 (중복 계산 제거)
+            active_layers = self.active_layers if self.experiment_type == "W4" else []
             
             exp_specific = compute_all_experiment_metrics(
                 experiment_type=self.experiment_type,
                 model=self.model,
-                hooks_data=hooks_data,
+                hooks_data=hooks_data if hooks_data else None,
                 tod_vec=tod_vec,
                 direct_evidence=direct_evidence,
                 perturbation_type=self.cfg.get("perturbation"),
