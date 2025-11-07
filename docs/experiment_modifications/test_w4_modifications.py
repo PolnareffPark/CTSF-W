@@ -41,7 +41,7 @@ def test_w4_active_layers():
         
         try:
             # 모델만 생성하고 테스트 (학습은 스킬)
-            model = HybridTS(cfg, C=7)
+            model = HybridTS(cfg, n_vars=7)
             actual_depth = len(model.xhconv_blks)
             
             # W4Experiment에서 active_layers 계산 로직 재현
