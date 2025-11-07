@@ -141,6 +141,9 @@ class BaseExperiment:
             tod_vec=tod_vec, device=self.device
         )
         
+        # hooks_data로 direct 지표 전달
+        hooks_data = direct.copy()
+        
         # 실험별 특화 지표 계산
         try:
             from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
@@ -163,7 +166,7 @@ class BaseExperiment:
             exp_specific = compute_all_experiment_metrics(
                 experiment_type=self.experiment_type,
                 model=self.model,
-                hooks_data=None,  # TODO: hooks_data 수집 필요
+                hooks_data=hooks_data,
                 tod_vec=tod_vec,
                 perturbation_type=self.cfg.get("perturbation"),
                 active_layers=active_layers,
@@ -175,6 +178,38 @@ class BaseExperiment:
         except ImportError:
             # 실험별 특화 지표 모듈이 없으면 스킵
             pass
+        
+        # 보고용 그림 지표 계산 (선택적)
+        try:
+            from utils.plotting_metrics import compute_all_plotting_metrics
+            
+            # 작은 배치만 사용하여 계산 부담 최소화
+            small_loader = torch.utils.data.DataLoader(
+                self.test_loader.dataset,
+                batch_size=min(16, self.cfg.get("batch_size", 128)),
+                shuffle=False,
+                num_workers=0
+            )
+            
+            plotting_metrics = compute_all_plotting_metrics(
+                model=self.model,
+                loader=small_loader,
+                mu=self.mu,
+                std=self.std,
+                tod_vec=tod_vec,
+                device=self.device,
+                experiment_type=self.experiment_type,
+                hooks_data=hooks_data,
+                compute_grad_align=self.cfg.get("compute_grad_align", False)
+            )
+            
+            # 지표 통합
+            for k, v in plotting_metrics.items():
+                direct[k] = v
+        except Exception as e:
+            # 그림 지표 계산 실패해도 계속 진행
+            if self.cfg.get("verbose", True):
+                print(f"경고: 보고용 그림 지표 계산 실패: {e}")
         
         return direct
     
@@ -192,6 +227,39 @@ class BaseExperiment:
         }
         fpath = save_results_unified(row, out_root=str(self.out_root), experiment_type=self.experiment_type)
         print(f"[saved] {fpath}")
+        
+        # 보고용 그림 데이터 저장 (선택적)
+        try:
+            from utils.plot_results import save_plot_data
+            
+            # 그림 타입별로 데이터 저장
+            plot_types = {
+                "W1": ["forest_plot", "cka_heatmap", "grad_align_bar"],
+                "W2": ["forest_plot", "gate_tod_heatmap", "gate_distribution"],
+                "W3": ["effect_size_bar", "rank_preservation", "lag_distribution"],
+                "W4": ["rmse_line", "gate_usage_bar", "cka_heatmap"],
+                "W5": ["degradation_bar", "gate_distribution"],
+            }
+            
+            for plot_type in plot_types.get(self.experiment_type, []):
+                # 해당 그림 타입에 필요한 데이터만 추출
+                plot_data = {k: v for k, v in direct_metrics.items() 
+                            if k.startswith(plot_type.split('_')[0]) or 
+                            k in ['rmse', 'mse_real', 'mae'] or
+                            'cka' in k or 'grad_align' in k or 'gate' in k or 'bestlag' in k}
+                
+                if plot_data:
+                    save_plot_data(
+                        experiment_type=self.experiment_type,
+                        dataset=self.dataset_tag,
+                        plot_type=plot_type,
+                        plot_data=plot_data,
+                        results_root=str(self.out_root)
+                    )
+        except Exception as e:
+            if self.cfg.get("verbose", True):
+                print(f"경고: 보고용 그림 데이터 저장 실패: {e}")
+        
         return fpath
     
     def cleanup(self):

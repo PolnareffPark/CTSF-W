@@ -66,8 +66,31 @@ def compute_w5_metrics(
         metrics["w5_event_gain_loss"] = np.nan
     
     # 게이트-이벤트 정렬 손실
-    # 간단히 이벤트 게인과 게이트 변동성의 상관으로 근사
-    # TODO: 실제 게이트-이벤트 정렬 계산 필요
-    metrics["w5_gate_event_alignment_loss"] = np.nan
+    # 게이트 값과 이벤트(피크) 발생 시점의 정렬 정도
+    # dynamic에서는 게이트가 이벤트에 반응하지만, fixed에서는 반응하지 않음
+    event_dynamic = dynamic_model_metrics.get("cg_event_gain", np.nan)
+    event_fixed = fixed_model_metrics.get("cg_event_gain", np.nan)
+    
+    # 게이트 변동성 (W2 지표에서 계산된 값 사용 가능)
+    gate_var_dynamic = dynamic_model_metrics.get("w2_gate_variability_time", np.nan)
+    gate_var_fixed = fixed_model_metrics.get("w2_gate_variability_time", np.nan)
+    
+    # 게이트-이벤트 정렬 = 게이트 변동성과 이벤트 게인의 상관 관계
+    # dynamic에서는 게이트가 이벤트에 반응하므로 정렬이 높고,
+    # fixed에서는 게이트가 고정되어 정렬이 낮음
+    if (np.isfinite(event_dynamic) and np.isfinite(event_fixed) and
+        np.isfinite(gate_var_dynamic) and np.isfinite(gate_var_fixed)):
+        # 정렬 손실 = (dynamic의 정렬) - (fixed의 정렬)
+        # 간단히: 이벤트 게인과 게이트 변동성의 곱으로 근사
+        alignment_dynamic = event_dynamic * gate_var_dynamic if gate_var_dynamic > 0 else 0
+        alignment_fixed = event_fixed * gate_var_fixed if gate_var_fixed > 0 else 0
+        loss = alignment_dynamic - alignment_fixed
+        metrics["w5_gate_event_alignment_loss"] = float(loss)
+    else:
+        # 대안: 이벤트 게인 차이로 근사
+        if np.isfinite(event_dynamic) and np.isfinite(event_fixed):
+            metrics["w5_gate_event_alignment_loss"] = float(event_dynamic - event_fixed)
+        else:
+            metrics["w5_gate_event_alignment_loss"] = np.nan
     
     return metrics
