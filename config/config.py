@@ -34,8 +34,17 @@ def load_config(config_path="hp2_config.yaml"):
     # model
     if "model" in yaml_cfg:
         for k, v in yaml_cfg["model"].items():
-            if k == "alpha_init" or k == "revin":
-                continue  # 하위 구조는 스킵
+            if k == "alpha_init":
+                # alpha_init 하위 구조 처리
+                if isinstance(v, dict):
+                    cfg["alpha_init_diag"] = v.get("diag", 0.90)
+                    cfg["alpha_init_offdiag"] = v.get("offdiag", 0.05)
+                continue
+            elif k == "revin":
+                # revin 하위 구조 처리
+                if isinstance(v, dict):
+                    cfg["revin_affine"] = v.get("affine", True)
+                continue
             cfg[k] = v
     
     # loss

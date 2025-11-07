@@ -10,6 +10,7 @@ from pathlib import Path
 from utils.training import train_one_epoch, evaluate, EarlyStop, cleanup_resources
 from utils.direct_evidence import evaluate_with_direct_evidence
 from utils.csv_logger import save_results_unified
+import time
 from data.dataset import load_split_dataloaders, build_test_tod_vector
 
 
@@ -18,11 +19,14 @@ class BaseExperiment:
     
     def __init__(self, cfg):
         self.cfg = cfg
-        self.device = cfg["device"]
+        self.device = cfg.get("device", "cuda")
         self.dataset_tag = Path(cfg["csv_path"]).stem
         self.out_root = Path(cfg.get("out_dir", "results"))
         self.out_dir = self.out_root / self.dataset_tag
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.experiment_type = cfg.get("experiment_type", "W1")
+        self.start_time = None
+        self.train_time = None
         
         # 데이터 로딩
         self.train_loader, self.val_loader, self.test_loader, (mu_np, std_np, C) = \
@@ -35,13 +39,14 @@ class BaseExperiment:
         self.model = self._create_model()
         self.model = self.model.to(self.device)
         
-        # 옵티마이저 및 스케줄러
+        # 옵티마이저 및 스케줄러 (기존 CTSF-V1.py와 동일)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=cfg["lr"],
             weight_decay=cfg.get("weight_decay", 1e-3)
         )
         
+        # OneCycleLR 스케줄러 (기존과 동일)
         total_steps = len(self.train_loader) * cfg["epochs"]
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
@@ -52,6 +57,7 @@ class BaseExperiment:
             final_div_factor=1e4
         )
         
+        # EarlyStop (기존과 동일: patience=20)
         self.stopper = EarlyStop(
             patience=cfg.get("early_stop_patience", 20),
             min_delta=cfg.get("early_stop_min_delta", 1e-3)
@@ -71,6 +77,7 @@ class BaseExperiment:
     
     def train(self):
         """학습"""
+        self.start_time = time.time()
         start_ep, best_val, best_state_cpu = 1, float("inf"), None
         
         # 체크포인트 로드
@@ -99,7 +106,9 @@ class BaseExperiment:
                 self.model, self.val_loader, self.mu, self.std,
                 tag="Val", epoch=ep, device=self.device, metrics=False
             )
-            print(f"[{ep:02d}] train {tr_loss:.4f} | val {val_loss:.4f}")
+            # 간단한 로그만 출력 (전체 실험 시 과도한 출력 방지)
+            if self.cfg.get("verbose", True):
+                print(f"[{ep:02d}] train {tr_loss:.4f} | val {val_loss:.4f}")
             
             if val_loss < best_val:
                 best_val = val_loss
@@ -121,6 +130,7 @@ class BaseExperiment:
         
         # Best 모델 로드
         self.model.load_state_dict({k: v.to(self.device) for k, v in best_state_cpu.items()})
+        self.train_time = time.time() - self.start_time
         return best_state_cpu
     
     def evaluate_test(self):
@@ -130,6 +140,42 @@ class BaseExperiment:
             self.model, self.test_loader, self.mu, self.std,
             tod_vec=tod_vec, device=self.device
         )
+        
+        # 실험별 특화 지표 계산
+        try:
+            from utils.experiment_specific_metrics import compute_experiment_specific_metrics
+            
+            # W4의 경우 active_layers 정보 필요
+            active_layers = []
+            if self.experiment_type == "W4":
+                cross_layers = self.cfg.get("cross_layers", "all")
+                depth = self.cfg.get("cnn_depth", 7)
+                if cross_layers == "all":
+                    active_layers = list(range(depth))
+                elif cross_layers == "shallow":
+                    active_layers = list(range(max(1, depth // 3)))
+                elif cross_layers == "mid":
+                    start = depth // 3
+                    active_layers = list(range(start, start + max(1, depth // 3)))
+                elif cross_layers == "deep":
+                    active_layers = list(range(depth - max(1, depth // 3), depth))
+            
+            exp_specific = compute_experiment_specific_metrics(
+                experiment_type=self.experiment_type,
+                model=self.model,
+                hooks_data=None,  # TODO: hooks_data 수집 필요
+                tod_vec=tod_vec,
+                perturbation_type=self.cfg.get("perturbation"),
+                active_layers=active_layers,
+            )
+            
+            # 지표 통합 (w1_, w2_ 등의 접두사 유지)
+            for k, v in exp_specific.items():
+                direct[k] = v
+        except ImportError:
+            # 실험별 특화 지표 모듈이 없으면 스킵
+            pass
+        
         return direct
     
     def save_results(self, direct_metrics):
@@ -140,9 +186,11 @@ class BaseExperiment:
             "seed": int(self.cfg["seed"]),
             "mode": self.cfg.get("mode", "default"),
             "model_tag": self.cfg.get("model_tag", "HyperConv"),
+            "experiment_type": self.experiment_type,
+            "train_time_s": self.train_time if self.train_time else 0.0,
             **direct_metrics
         }
-        fpath = save_results_unified(row, out_root=str(self.out_root))
+        fpath = save_results_unified(row, out_root=str(self.out_root), experiment_type=self.experiment_type)
         print(f"[saved] {fpath}")
         return fpath
     

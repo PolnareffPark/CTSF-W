@@ -58,7 +58,7 @@ def load_split_dataloaders(cfg):
     C = data.shape[1]  # 변수 수
     L, H = cfg["lookback"], cfg["horizon"]
 
-    # 분할
+    # 분할 (기존 CTSF-V1.py와 동일)
     total = len(data) - L - H + 1
     n_tr = int(total * cfg["train_ratio"])
     n_val = int(total * cfg["val_ratio"])
@@ -68,17 +68,18 @@ def load_split_dataloaders(cfg):
     val_end = val_st + n_val
     te_st = val_end + margin
 
-    # DataLoader 생성
+    # DataLoader 생성 (기존과 동일)
     def mk_dataloader(sub, shuffle):
         return DataLoader(
             MVDataset(sub, L, H),
-            batch_size=cfg["batch_size"],
+            batch_size=cfg.get("batch_size", 128),
             shuffle=shuffle,
             drop_last=cfg.get("drop_last", True),
             num_workers=cfg.get("num_workers", 4),
             pin_memory=cfg.get("pin_memory", True)
         )
 
+    # 기존과 동일한 인덱싱
     train_loader = mk_dataloader(data[:tr_end + L + H - 1], True)
     val_loader = mk_dataloader(data[val_st:val_end + L + H - 1], False)
     test_loader = mk_dataloader(data[te_st:], False)

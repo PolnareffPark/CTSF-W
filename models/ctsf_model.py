@@ -140,13 +140,13 @@ class CrossHyperConvBlock(nn.Module):
     Dual-direction HyperConv + α Cross-Stitch
     ⚠️ 이 블록은 실험별로 동작을 제어할 수 있지만, 구조 자체는 변경하지 않습니다.
     """
-    def __init__(self, d_embed, k=3, p_drop=0.1):
+    def __init__(self, d_embed, k=3, p_drop=0.1, alpha_diag=0.90, alpha_offdiag=0.05):
         super().__init__()
         self.hc_gc = HyperConv1D(d_embed, k)  # GRU → Conv
         self.hc_cg = HyperConv1D(d_embed, k)  # Conv → GRU
 
-        # α 초기 diag=0.95, off-diag=0.02
-        alpha = torch.eye(2) * 0.90 + 0.05
+        # α 초기값 설정 (hp2_config.yaml에서 가져옴)
+        alpha = torch.eye(2) * alpha_diag + alpha_offdiag
         self.alpha = nn.Parameter(alpha)
 
         self.ln_c = nn.LayerNorm(d_embed)
@@ -208,14 +208,21 @@ class HybridTS(nn.Module):
         depth = cfg["cnn_depth"]
 
         # Pre-net
-        self.revin = RevIN(dim=n_vars, affine=True)
+        revin_affine = cfg.get("revin_affine", True)
+        self.revin = RevIN(dim=n_vars, affine=revin_affine)
         self.patch = nn.Conv1d(n_vars, d, kernel_size=Pl, stride=Pl)
 
         # Backbone
-        self.conv_blks = nn.ModuleList([ResConvBlock(d, 3, dp) for _ in range(depth)])
+        conv_kernel = cfg.get("conv_kernel", 3)
+        hyperconv_k = cfg.get("hyperconv_k", 3)
+        alpha_diag = cfg.get("alpha_init_diag", 0.90)
+        alpha_offdiag = cfg.get("alpha_init_offdiag", 0.05)
+        
+        self.conv_blks = nn.ModuleList([ResConvBlock(d, conv_kernel, dp) for _ in range(depth)])
         self.gru_blks = nn.ModuleList([GRUBlock(d, dp) for _ in range(depth)])
         self.xhconv_blks = nn.ModuleList([
-            CrossHyperConvBlock(d, k=3, p_drop=dp) for _ in range(depth)
+            CrossHyperConvBlock(d, k=hyperconv_k, p_drop=dp, alpha_diag=alpha_diag, alpha_offdiag=alpha_offdiag) 
+            for _ in range(depth)
         ])
 
         # Fusion & Head

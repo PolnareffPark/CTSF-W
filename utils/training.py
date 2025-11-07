@@ -10,7 +10,7 @@ import gc
 
 def ps_loss(pred, tgt, lam_patch=0.03):
     """
-    Patch-Stat + MSE 손실
+    Patch-Stat + MSE 손실 (기존 CTSF-V1.py와 동일)
     
     Args:
         pred, tgt: (B, C, H) – RevIN 정규화 공간

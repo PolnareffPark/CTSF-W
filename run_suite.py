@@ -4,6 +4,8 @@
 """
 
 import argparse
+import time
+import traceback
 from pathlib import Path
 from config.config import load_config, apply_HP2
 from experiments.w1_experiment import W1Experiment
@@ -12,18 +14,12 @@ from experiments.w3_experiment import W3Experiment
 from experiments.w4_experiment import W4Experiment
 from experiments.w5_experiment import W5Experiment
 from utils.csv_logger import read_results_rows
+from utils.error_logger import log_experiment_error
 
 
 def _norm_str(x):
     return str(x).strip()
-
-
-def _try_int(x):
-    try:
-        return int(x)
-    except:
-        return None
-
+    
 
 def _csv_path_or_mnt(name, root_csv="datasets"):
     p1 = Path(root_csv) / f"{name}.csv"
@@ -52,7 +48,8 @@ def run_experiment_suite(
     max_jobs=None,
     device="cuda",
     config_path="hp2_config.yaml",
-    dry_run=False
+    dry_run=False,
+    verbose=True
 ):
     """
     실험 스위트 실행
@@ -86,8 +83,8 @@ def run_experiment_suite(
         else:
             modes = ["default"]
     
-    # 결과 파일 읽기
-    rows, done_set_all = read_results_rows(results_root)
+    # 결과 파일 읽기 (실험별로 분리)
+    rows, done_set_all = read_results_rows(results_root, experiment_type=experiment_type)
     
     # 필터 적용
     datasets = tuple(map(_norm_str, datasets))
@@ -177,8 +174,31 @@ def run_experiment_suite(
     # 설정 로드
     base_cfg = load_config(config_path)
     
+    # 시간 추적
+    suite_start_time = time.time()
+    completed = 0
+    total_jobs = len(plan)
+    
     # 실행
-    for ds, H, s, md in plan:
+    for job_idx, (ds, H, s, md) in enumerate(plan, 1):
+        job_start_time = time.time()
+        
+        # 진행 상황 출력
+        elapsed = time.time() - suite_start_time
+        if completed > 0 and total_jobs > 0:
+            avg_time_per_job = elapsed / completed
+            remaining_jobs = total_jobs - completed
+            eta_seconds = avg_time_per_job * remaining_jobs
+            eta_str = f"{eta_seconds/3600:.1f}h" if eta_seconds > 3600 else f"{eta_seconds/60:.1f}m"
+        else:
+            eta_str = "계산 중..."
+        
+        if verbose:
+            print(f"\n=== [{job_idx}/{total_jobs}] RUN :: exp={experiment_type} | ds={ds} | H={H} | seed={s} | mode={md} ===")
+            print(f"진행: {completed}/{total_jobs} 완료 | 경과: {elapsed/3600:.2f}h | 예상 남은 시간: {eta_str}")
+        else:
+            print(f"[{job_idx}/{total_jobs}] {experiment_type} {ds} H={H} s={s} {md}... (예상 남은 시간: {eta_str})", end=" ", flush=True)
+        
         try:
             cfg = apply_HP2(
                 base_cfg,
@@ -192,14 +212,15 @@ def run_experiment_suite(
             
             # 실험별 모드 설정
             cfg["mode"] = md
+            cfg["experiment_type"] = experiment_type
+            cfg["verbose"] = verbose
             if experiment_type == "W3":
                 cfg["perturbation"] = md if md != "none" else None
+                cfg["perturbation_kwargs"] = {}  # 필요시 추가
             elif experiment_type == "W4":
                 cfg["cross_layers"] = md
             elif experiment_type == "W5":
                 cfg["gate_fixed"] = (md == "fixed")
-            
-            print(f"\n=== RUN :: exp={experiment_type} | ds={ds} | H={H} | seed={s} | mode={md} ===")
             
             # 실험 실행
             if experiment_type == "W1":
@@ -216,11 +237,33 @@ def run_experiment_suite(
                 raise ValueError(f"Unknown experiment_type: {experiment_type}")
             
             exp.run()
+            completed += 1
+            job_time = time.time() - job_start_time
             
+            if not verbose:
+                print(f"✓ ({job_time/60:.1f}m)")
+            elif verbose:
+                print(f"완료 - 소요 시간: {job_time/60:.1f}분")
+        
         except Exception as e:
-            print(f"[ERROR] {ds}-H{H}-s{s}-{md} failed: {e}")
-            import traceback
-            traceback.print_exc()
+            # 오류 로깅
+            error_tb = traceback.format_exc()
+            log_experiment_error(
+                experiment_type=experiment_type,
+                dataset=ds,
+                horizon=H,
+                seed=s,
+                mode=md,
+                error_message=str(e),
+                error_traceback=error_tb,
+                results_root=results_root
+            )
+            
+            if verbose:
+                print(f"[ERROR] {ds}-H{H}-s{s}-{md} failed: {e}")
+                print(error_tb)
+            else:
+                print(f"✗ ({str(e)[:50]})")
             continue
 
 
@@ -251,6 +294,8 @@ if __name__ == "__main__":
                         help="설정 파일 경로")
     parser.add_argument("--dry_run", action="store_true",
                         help="계획만 출력")
+    parser.add_argument("--verbose", action="store_true", default=True,
+                        help="상세 로그 출력")
     
     args = parser.parse_args()
     
@@ -265,5 +310,6 @@ if __name__ == "__main__":
         overwrite=args.overwrite,
         max_jobs=args.max_jobs,
         config_path=args.config,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        verbose=args.verbose
     )

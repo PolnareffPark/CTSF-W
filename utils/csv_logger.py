@@ -8,21 +8,27 @@ import numpy as np
 from pathlib import Path
 
 
-def save_results_unified(row: dict, out_root: str = "results"):
+def save_results_unified(row: dict, out_root: str = "results", experiment_type: str = None):
     """
-    통합 CSV에 결과 저장 (업서트 방식)
+    실험별 CSV에 결과 저장 (업서트 방식)
     
     Args:
         row: 결과 딕셔너리 (dataset, horizon, seed, mode, model_tag, 지표들 포함)
         out_root: 결과 저장 루트 디렉토리
+        experiment_type: 실험 타입 (W1, W2, W3, W4, W5) - None이면 row에서 추출
     """
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
-    fpath = out_root / "results.csv"
+    
+    # 실험 타입 추출
+    if experiment_type is None:
+        experiment_type = row.get("experiment_type", "W1")
+    
+    fpath = out_root / f"results_{experiment_type}.csv"
 
-    # 컬럼 순서 정의
-    cols_order = [
-        "dataset", "horizon", "seed", "mode", "model_tag",
+    # 컬럼 순서 정의 (공통 지표 + 실험별 특화 지표)
+    base_cols = [
+        "dataset", "horizon", "seed", "mode", "model_tag", "experiment_type",
         "mse_std", "mse_real", "rmse", "mae",
         # Conv→GRU
         "cg_pearson_mean", "cg_spearman_mean", "cg_dcor_mean",
@@ -31,6 +37,36 @@ def save_results_unified(row: dict, out_root: str = "results"):
         "gc_kernel_tod_dcor", "gc_feat_tod_dcor", "gc_feat_tod_r2",
         "gc_kernel_feat_dcor", "gc_kernel_feat_align",
     ]
+    
+    # 실험별 특화 지표 컬럼
+    exp_specific_cols = {
+        "W1": [
+            "w1_cka_similarity_cnn_gru", "w1_cca_similarity_cnn_gru",
+            "w1_layerwise_upward_improvement", "w1_inter_path_gradient_align",
+        ],
+        "W2": [
+            "w2_gate_variability_time", "w2_gate_variability_sample", "w2_gate_entropy",
+            "w2_gate_tod_alignment", "w2_gate_gru_state_alignment",
+            "w2_event_conditional_response",
+            "w2_channel_selectivity_kurtosis", "w2_channel_selectivity_sparsity",
+        ],
+        "W3": [
+            "w3_intervention_effect_rmse", "w3_intervention_effect_tod", "w3_intervention_effect_peak",
+            "w3_intervention_cohens_d", "w3_rank_preservation_rate", "w3_lag_distribution_change",
+        ],
+        "W4": [
+            "w4_layer_contribution_score", "w4_layerwise_gate_usage",
+            "w4_layerwise_representation_similarity",
+        ],
+        "W5": [
+            "w5_performance_degradation_ratio", "w5_sensitivity_gain_loss",
+            "w5_event_gain_loss", "w5_gate_event_alignment_loss",
+        ],
+    }
+    
+    # 실험 타입에 맞는 컬럼 선택
+    exp_cols = exp_specific_cols.get(experiment_type, [])
+    cols_order = base_cols + exp_cols
 
     # 누락된 컬럼은 NaN으로 채우기
     for c in cols_order:
@@ -57,38 +93,50 @@ def save_results_unified(row: dict, out_root: str = "results"):
     return str(fpath)
 
 
-def read_results_rows(results_root="results"):
+def read_results_rows(results_root="results", experiment_type=None):
     """
     기존 결과 읽기 (resume 기능용)
+    
+    Args:
+        results_root: 결과 루트 디렉토리
+        experiment_type: 실험 타입 (W1, W2, ...) - None이면 모든 실험 파일 검색
     
     Returns:
         (rows, done_set): 완료된 실험 조합 리스트와 집합
     """
-    f = Path(results_root) / "results.csv"
-    if not f.exists():
-        return [], set()
-
-    df = pd.read_csv(f)
-    # 안전 변환
-    if "dataset" in df.columns:
-        df["dataset"] = df["dataset"].astype(str).str.strip()
-    if "mode" in df.columns:
-        df["mode"] = df["mode"].astype(str).str.strip()
-    if "horizon" in df.columns:
-        df["horizon"] = df["horizon"].apply(lambda x: int(x) if pd.notna(x) else None)
-    if "seed" in df.columns:
-        df["seed"] = df["seed"].apply(lambda x: int(x) if pd.notna(x) else None)
-
     rows = []
     done = set()
-    for _, r in df.iterrows():
-        key = (
-            str(r.get("dataset", "")).strip(),
-            int(r.get("horizon", 0)) if pd.notna(r.get("horizon")) else None,
-            int(r.get("seed", 0)) if pd.notna(r.get("seed")) else None,
-            str(r.get("mode", "")).strip()
-        )
-        rows.append(key)
-        done.add(key)
+    
+    # 실험별 CSV 파일 읽기
+    if experiment_type:
+        files = [Path(results_root) / f"results_{experiment_type}.csv"]
+    else:
+        # 모든 실험 파일 검색
+        files = list(Path(results_root).glob("results_W*.csv"))
+    
+    for f in files:
+        if not f.exists():
+            continue
+        
+        df = pd.read_csv(f)
+        # 안전 변환
+        if "dataset" in df.columns:
+            df["dataset"] = df["dataset"].astype(str).str.strip()
+        if "mode" in df.columns:
+            df["mode"] = df["mode"].astype(str).str.strip()
+        if "horizon" in df.columns:
+            df["horizon"] = df["horizon"].apply(lambda x: int(float(x)) if pd.notna(x) else None)
+        if "seed" in df.columns:
+            df["seed"] = df["seed"].apply(lambda x: int(float(x)) if pd.notna(x) else None)
+
+        for _, r in df.iterrows():
+            key = (
+                str(r.get("dataset", "")).strip(),
+                int(float(r.get("horizon", 0))) if pd.notna(r.get("horizon")) else None,
+                int(float(r.get("seed", 0))) if pd.notna(r.get("seed")) else None,
+                str(r.get("mode", "")).strip()
+            )
+            rows.append(key)
+            done.add(key)
 
     return rows, done
