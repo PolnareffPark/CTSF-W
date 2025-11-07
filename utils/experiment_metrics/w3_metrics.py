@@ -6,25 +6,6 @@ import numpy as np
 from typing import Dict, Optional
 
 
-def _cohens_d(x1: np.ndarray, x2: np.ndarray) -> float:
-    """Cohen's d 효과 크기 계산"""
-    if len(x1) < 2 or len(x2) < 2:
-        return np.nan
-    
-    m1, m2 = np.mean(x1), np.mean(x2)
-    s1, s2 = np.std(x1, ddof=1), np.std(x2, ddof=1)
-    n1, n2 = len(x1), len(x2)
-    
-    # Pooled standard deviation
-    pooled_std = np.sqrt(((n1 - 1) * s1 ** 2 + (n2 - 1) * s2 ** 2) / (n1 + n2 - 2))
-    
-    if pooled_std < 1e-12:
-        return np.nan
-    
-    d = (m1 - m2) / pooled_std
-    return float(d) if np.isfinite(d) else np.nan
-
-
 def compute_w3_metrics(
     model,
     hooks_data: Optional[Dict] = None,
@@ -44,9 +25,7 @@ def compute_w3_metrics(
         - w3_intervention_effect_rmse: 개입 효과 (ΔRMSE)
         - w3_intervention_effect_tod: 개입 효과 (ΔTOD)
         - w3_intervention_effect_peak: 개입 효과 (Δpeak)
-        - w3_intervention_cohens_d: Cohen's d (효과 크기)
-        - w3_rank_preservation_rate: 순위 보존률
-        - w3_lag_distribution_change: 라그 분포 변화
+        - w3_intervention_cohens_d: Cohen's d (효과 크기, 배치별 RMSE 표준편차 기준)
     """
     metrics = {}
     
@@ -85,51 +64,23 @@ def compute_w3_metrics(
             metrics["w3_intervention_effect_peak"] = np.nan
         
         # Cohen's d (효과 크기)
-        # 간단히 RMSE 차이를 표준화
+        # RMSE 차이를 baseline RMSE의 표준편차로 나눔
         if np.isfinite(metrics["w3_intervention_effect_rmse"]):
-            # 가정: baseline의 표준편차를 사용
-            baseline_std = baseline_metrics.get("rmse_std", 1.0)
-            if baseline_std > 1e-12:
+            # baseline의 표준편차를 사용
+            baseline_std = baseline_metrics.get("rmse_std", 0.0)
+            
+            # 표준편차가 충분히 큰 경우에만 Cohen's d 계산
+            if baseline_std > 1e-6:
                 metrics["w3_intervention_cohens_d"] = float(metrics["w3_intervention_effect_rmse"] / baseline_std)
             else:
-                metrics["w3_intervention_cohens_d"] = np.nan
+                # 표준편차가 0에 가까우면 대안: baseline RMSE의 비율로 계산
+                # (표준편차가 없을 경우 상대적 변화량으로 효과 크기 근사)
+                if baseline_rmse > 1e-6:
+                    # 상대적 효과 크기 = (current - baseline) / baseline
+                    metrics["w3_intervention_cohens_d"] = float(metrics["w3_intervention_effect_rmse"] / baseline_rmse)
+                else:
+                    metrics["w3_intervention_cohens_d"] = np.nan
         else:
             metrics["w3_intervention_cohens_d"] = np.nan
-    
-    # 순위 보존률: 교란 전후 성능 순위가 얼마나 유지되는지
-    # 참고: 순위 보존률은 여러 데이터셋/horizon 조합에서의 순위를 비교해야 정확히 계산 가능
-    # 현재는 단일 실험에 대해서만 처리하므로, 전체 실험 결과를 모은 후 별도로 계산해야 함
-    # 여기서는 교란 전후 RMSE 비율로 근사 계산
-    if baseline_metrics is not None and hooks_data is not None:
-        current_rmse = hooks_data.get("rmse", np.nan) if hooks_data else np.nan
-        baseline_rmse = baseline_metrics.get("rmse", np.nan)
-        
-        if np.isfinite(current_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0:
-            # RMSE 비율이 1에 가까우면 순위가 유지됨 (교란 영향이 적음)
-            # 비율이 크게 벗어나면 순위 변화 (교란 영향이 큼)
-            rmse_ratio = current_rmse / baseline_rmse
-            # 순위 보존률 = 1 - |1 - ratio| (1에 가까울수록 보존률 높음)
-            preservation = 1.0 - min(abs(1.0 - rmse_ratio), 1.0)
-            metrics["w3_rank_preservation_rate"] = float(preservation)
-        else:
-            metrics["w3_rank_preservation_rate"] = np.nan
-    else:
-        metrics["w3_rank_preservation_rate"] = np.nan
-    
-    # 라그 분포 변화: bestlag 분포의 변화
-    if baseline_metrics is not None and hooks_data is not None:
-        current_bestlag = hooks_data.get("cg_bestlag", np.nan) if hooks_data else np.nan
-        baseline_bestlag = baseline_metrics.get("cg_bestlag", np.nan)
-        
-        # bestlag 분포 변화를 요약 통계로 표현
-        # 실제로는 전체 분포를 비교해야 하지만, 여기서는 평균 차이로 근사
-        if np.isfinite(current_bestlag) and np.isfinite(baseline_bestlag):
-            # 라그 분포 변화 = 평균 라그의 변화
-            lag_change = abs(current_bestlag - baseline_bestlag)
-            metrics["w3_lag_distribution_change"] = float(lag_change)
-        else:
-            metrics["w3_lag_distribution_change"] = np.nan
-    else:
-        metrics["w3_lag_distribution_change"] = np.nan
     
     return metrics

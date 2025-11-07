@@ -136,13 +136,21 @@ class BaseExperiment:
     def evaluate_test(self):
         """테스트 평가 (직접 근거 지표 포함)"""
         tod_vec = build_test_tod_vector(self.cfg)
+        
+        # W2 실험이면 게이트 출력 수집
+        collect_gates = (self.experiment_type == "W2")
+        
         direct = evaluate_with_direct_evidence(
             self.model, self.test_loader, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device
+            tod_vec=tod_vec, device=self.device,
+            collect_gate_outputs=collect_gates
         )
         
-        # hooks_data로 direct 지표 전달
-        hooks_data = direct.copy()
+        # hooks_data 추출 (W2 실험용)
+        hooks_data = direct.pop('hooks_data', None)
+        
+        # direct_evidence는 direct 자체 (성능 및 직접 근거 지표)
+        direct_evidence = direct.copy()
         
         # 실험별 특화 지표 계산
         try:
@@ -168,6 +176,7 @@ class BaseExperiment:
                 model=self.model,
                 hooks_data=hooks_data,
                 tod_vec=tod_vec,
+                direct_evidence=direct_evidence,
                 perturbation_type=self.cfg.get("perturbation"),
                 active_layers=active_layers,
             )

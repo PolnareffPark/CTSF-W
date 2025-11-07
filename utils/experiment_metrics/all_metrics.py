@@ -32,7 +32,12 @@ def compute_all_experiment_metrics(
     if experiment_type == "W1":
         return compute_w1_metrics(model, hooks_data, kwargs.get("tod_vec"))
     elif experiment_type == "W2":
-        return compute_w2_metrics(model, hooks_data, kwargs.get("tod_vec"))
+        return compute_w2_metrics(
+            model=model,
+            hooks_data=hooks_data,
+            tod_vec=kwargs.get("tod_vec"),
+            direct_evidence=kwargs.get("direct_evidence")
+        )
     elif experiment_type == "W3":
         return compute_w3_metrics(
             model, hooks_data,

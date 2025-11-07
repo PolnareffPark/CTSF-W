@@ -5,7 +5,7 @@ TOD 민감도, 피크 반응 등 직접 근거 지표 계산
 
 import torch
 import numpy as np
-from utils.hooks import LastBlockHooks
+from utils.hooks import LastBlockHooks, GateOutputHooks
 from utils.metrics import (
     _time_deriv_norm, _pearson_corr, _spearman_corr, _dcor_bt_u,
     _event_gain_and_hit, _maxcorr_and_lag_mean, _dcor_u, _multioutput_r2
@@ -13,7 +13,8 @@ from utils.metrics import (
 
 
 @torch.no_grad()
-def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=None):
+def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=None, 
+                                  collect_gate_outputs=False):
     """
     직접 근거 지표 포함 평가
     
@@ -23,9 +24,10 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
         mu, std: 표준화 통계
         tod_vec: (N_test, 2) TOD [sin,cos] 벡터 또는 None
         device: 디바이스
+        collect_gate_outputs: W2 실험용 게이트 출력 수집 여부
     
     Returns:
-        지표 딕셔너리
+        지표 딕셔너리 (collect_gate_outputs=True이면 hooks_data 포함)
     """
     model.eval()
     if device is None:
@@ -40,6 +42,9 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
 
     # 누적 버퍼
     Pz_all, Tz_all, P_all, T_all = [], [], [], []
+    
+    # W3 실험용 배치별 RMSE 수집 (표준편차 계산용)
+    batch_rmse_list = []
 
     # Conv→GRU
     cg_p_list, cg_s_list, cg_dcor_list = [], [], []
@@ -50,25 +55,46 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
 
     hooks = LastBlockHooks(model)
     hooks.attach()
+    
+    # W2 실험용 게이트 수집
+    gate_hooks = None
+    if collect_gate_outputs:
+        gate_hooks = GateOutputHooks(model)
+        gate_hooks.attach()
+    
     sample_idx_base = 0
 
     for xb, yb in loader:
         xb, yb = xb.to(device), yb.to(device)
+        B = xb.size(0)
 
         # TOD 라벨(예측 시작 시점)
         y_tod = None
         if tod_vec is not None:
-            B = xb.size(0)
             y_tod = tod_vec[sample_idx_base: sample_idx_base + B, :]
             sample_idx_base += B
 
         # 예측
         pred = model(xb)
+        
+        # W2용 게이트 값 수집 (각 배치마다)
+        if gate_hooks is not None:
+            gate_hooks.collect_gate_values(B)
         # 표준화/실측 스케일 동시 누적
-        Pz_all.append(pred.detach().cpu().numpy())
-        Tz_all.append(yb.detach().cpu().numpy())
-        P_all.append((pred * std + mu).detach().cpu().numpy())
-        T_all.append((yb * std + mu).detach().cpu().numpy())
+        pred_np = pred.detach().cpu().numpy()
+        yb_np = yb.detach().cpu().numpy()
+        pred_real_np = (pred * std + mu).detach().cpu().numpy()
+        yb_real_np = (yb * std + mu).detach().cpu().numpy()
+        
+        Pz_all.append(pred_np)
+        Tz_all.append(yb_np)
+        P_all.append(pred_real_np)
+        T_all.append(yb_real_np)
+        
+        # 배치별 RMSE 계산 (W3 실험용)
+        batch_mse = ((pred_real_np - yb_real_np) ** 2).mean()
+        batch_rmse = float(np.sqrt(batch_mse))
+        batch_rmse_list.append(batch_rmse)
 
         # 내부 신호 (마지막 블록)
         C_pre = hooks.C_last_pre
@@ -110,6 +136,12 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
             Y_list.append(y_tod)
 
     hooks.detach()
+    
+    # W2용 게이트 hooks 정리 및 데이터 수집
+    hooks_data = None
+    if gate_hooks is not None:
+        hooks_data = gate_hooks.get_outputs()
+        gate_hooks.detach()
 
     # ---- 성능 (표준화/실측) ----
     Pz = np.concatenate(Pz_all, axis=0)
@@ -119,6 +151,9 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
     mse_std = float(((Pz - Tz) ** 2).mean())
     mse_real = float(((P - T) ** 2).mean())
     rmse = float(np.sqrt(mse_real))
+    
+    # 배치별 RMSE의 표준편차 (W3 실험용 Cohen's d 계산에 사용)
+    rmse_std = float(np.std(batch_rmse_list)) if len(batch_rmse_list) > 1 else 0.0
 
     # ---- Conv→GRU 요약 (cg_on일 때만 계산, 아니면 NaN) ----
     def _m(L):
@@ -173,8 +208,8 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
                 gc_kernel_feat_dcor = _dcor_u(X_sum, E)
                 gc_kernel_feat_align = gc_kernel_feat_dcor
 
-    return dict(
-        mse_std=mse_std, mse_real=mse_real, rmse=rmse,
+    result = dict(
+        mse_std=mse_std, mse_real=mse_real, rmse=rmse, rmse_std=rmse_std,
         # Conv → GRU
         cg_pearson_mean=cg_pearson_mean,
         cg_spearman_mean=cg_spearman_mean,
@@ -190,3 +225,9 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
         gc_kernel_feat_dcor=gc_kernel_feat_dcor,
         gc_kernel_feat_align=gc_kernel_feat_align,
     )
+    
+    # W2 실험용 hooks_data 추가
+    if hooks_data is not None:
+        result['hooks_data'] = hooks_data
+    
+    return result
