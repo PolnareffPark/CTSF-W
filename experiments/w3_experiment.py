@@ -114,23 +114,10 @@ class W3Experiment(BaseExperiment):
                 collect_gate_outputs=collect_gates
             )
             
-            hooks_data = direct.pop('hooks_data', None)
-            direct_evidence = direct.copy()
-            
-            # W3 지표 계산 (baseline이므로 모든 효과 지표는 0)
-            exp_specific = compute_all_experiment_metrics(
-                experiment_type=self.experiment_type,
-                model=self.model,
-                hooks_data=hooks_data,
-                tod_vec=tod_vec,
-                direct_evidence=direct_evidence,
-                perturbation_type=self.perturbation,
-                baseline_metrics=None,  # baseline 자체
-                active_layers=[],
-            )
-            
-            for k, v in exp_specific.items():
-                direct[k] = v
+            # W3 지표는 비교가 필요하므로 baseline 자체에서는 계산하지 않음
+            # win_errors는 CSV 저장 시 제외
+            direct.pop('hooks_data', None)
+            direct.pop('win_errors', None)  # 벡터는 CSV에 저장 불가
             
             return direct
         
@@ -151,11 +138,10 @@ class W3Experiment(BaseExperiment):
             collect_gate_outputs=collect_gates
         )
         
-        baseline_hooks_data = baseline_direct.pop('hooks_data', None)
-        baseline_metrics = baseline_direct.copy()
+        # hooks_data와 win_errors 제거 (metrics 계산용으로만 사용)
+        baseline_direct.pop('hooks_data', None)
         
         # 2. 교란 평가
-        # self.test_loader는 이미 PerturbedDataLoader로 래핑되어 있음
         print(f"[W3] Evaluating with perturbation: {self.perturbation}...")
         
         # 교란된 test_loader 생성
@@ -169,31 +155,37 @@ class W3Experiment(BaseExperiment):
             collect_gate_outputs=collect_gates
         )
         
-        current_hooks_data = current_direct.pop('hooks_data', None)
-        current_evidence = current_direct.copy()
+        # hooks_data 제거
+        current_direct.pop('hooks_data', None)
         
-        # 3. W3 특화 지표 계산 (baseline_metrics 전달)
+        # 3. W3 특화 지표 계산 (baseline_metrics와 perturb_metrics 전달)
+        # win_errors는 baseline_direct와 current_direct에 포함되어 있음
         exp_specific = compute_all_experiment_metrics(
             experiment_type=self.experiment_type,
             model=self.model,
-            hooks_data=current_hooks_data,
+            hooks_data=None,
             tod_vec=tod_vec,
-            direct_evidence=current_evidence,
             perturbation_type=self.perturbation,
-            baseline_metrics=baseline_metrics,  # baseline 전달
+            baseline_metrics=baseline_direct.copy(),  # 복사본 전달 (pop으로 변경되므로)
+            perturb_metrics=current_direct.copy(),    # 복사본 전달
+            w3_dz_ci=self.cfg.get("w3_dz_ci", False), # 선택적 부트스트랩 CI
             active_layers=[],
         )
         
-        # 4. baseline 정보도 결과에 포함 (가독성을 위해)
-        current_direct['rmse_baseline'] = baseline_metrics['rmse']
-        current_direct['gc_kernel_tod_dcor_baseline'] = baseline_metrics.get('gc_kernel_tod_dcor', float('nan'))
-        current_direct['cg_event_gain_baseline'] = baseline_metrics.get('cg_event_gain', float('nan'))
+        # 4. win_errors 제거 (벡터는 CSV에 저장 불가)
+        current_direct.pop('win_errors', None)
         
         # 5. W3 지표 통합
         for k, v in exp_specific.items():
             current_direct[k] = v
         
-        print(f"[W3] Baseline RMSE: {baseline_metrics['rmse']:.4f}, Perturbed RMSE: {current_direct['rmse']:.4f}")
-        print(f"[W3] Intervention effect (ΔRMSE): {exp_specific.get('w3_intervention_effect_rmse', 0.0):.4f}")
+        # 6. 출력
+        print(f"[W3] Baseline RMSE: {baseline_direct['rmse']:.4f}, Perturbed RMSE: {current_direct['rmse']:.4f}")
+        if 'w3_intervention_effect_rmse' in exp_specific:
+            print(f"[W3] Intervention effect (ΔRMSE%): {exp_specific['w3_intervention_effect_rmse']*100:.2f}%")
+        if 'w3_intervention_cohens_d' in exp_specific:
+            print(f"[W3] Cohen's d_z: {exp_specific['w3_intervention_cohens_d']:.4f}")
+        if 'w3_rmse_win_rate' in exp_specific:
+            print(f"[W3] Win-rate (교란>기준): {exp_specific['w3_rmse_win_rate']*100:.1f}%")
         
         return current_direct

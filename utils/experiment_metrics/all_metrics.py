@@ -39,10 +39,24 @@ def compute_all_experiment_metrics(
             direct_evidence=kwargs.get("direct_evidence")
         )
     elif experiment_type == "W3":
+        # W3는 baseline과 perturbed 결과를 비교하므로 새로운 인터페이스 사용
+        baseline_metrics = kwargs.get("baseline_metrics")
+        perturb_metrics = kwargs.get("perturb_metrics")
+        
+        # perturbation이 "none"이면 빈 딕셔너리 반환 (baseline 자체)
+        if kwargs.get("perturbation_type") == "none" or baseline_metrics is None:
+            return {}
+        
+        # 윈도우별 오차 벡터
+        win_errors_base = baseline_metrics.pop("win_errors", None) if baseline_metrics else None
+        win_errors_pert = perturb_metrics.pop("win_errors", None) if perturb_metrics else None
+        
         return compute_w3_metrics(
-            model, hooks_data,
-            kwargs.get("perturbation_type", "none"),
-            kwargs.get("baseline_metrics")
+            baseline_metrics=baseline_metrics,
+            perturb_metrics=perturb_metrics,
+            win_errors_base=win_errors_base,
+            win_errors_pert=win_errors_pert,
+            dz_ci=kwargs.get("w3_dz_ci", False)
         )
     elif experiment_type == "W4":
         return compute_w4_metrics(

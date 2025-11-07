@@ -154,6 +154,10 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
     
     # 배치별 RMSE의 표준편차 (W3 실험용 Cohen's d 계산에 사용)
     rmse_std = float(np.std(batch_rmse_list)) if len(batch_rmse_list) > 1 else 0.0
+    
+    # W3 실험용: 윈도우별 오차 벡터 (N,) - per-window MSE
+    # P, T는 (N, C, H) 형태, C와 H 축에 대해 평균하여 윈도우별 스칼라 오차로 변환
+    win_errors = np.mean((P - T) ** 2, axis=(1, 2))  # (N,)
 
     # ---- Conv→GRU 요약 (cg_on일 때만 계산, 아니면 NaN) ----
     def _m(L):
@@ -210,6 +214,7 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
 
     result = dict(
         mse_std=mse_std, mse_real=mse_real, rmse=rmse, rmse_std=rmse_std,
+        win_errors=win_errors,  # W3용: 윈도우별 오차 벡터
         # Conv → GRU
         cg_pearson_mean=cg_pearson_mean,
         cg_spearman_mean=cg_spearman_mean,
