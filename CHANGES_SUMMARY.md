@@ -1,5 +1,64 @@
 ## 📝 최근 변경 내역
 
+### 2025-11-07: W5 실험 코드 개선 (평가 피드백 반영)
+
+#### 1. W5Experiment.evaluate_test() 완전 재구성
+- **파일**: `experiments/w5_experiment.py`
+- **문제**: 기존 코드는 `gate_fixed` 플래그에 따라 동적 또는 고정 중 하나만 평가하여 W5 비교 지표가 계산되지 않음
+- **해결**: 한 번의 실행에서 동적과 고정 게이트를 모두 평가하도록 수정
+- **상세**:
+  - **동적 게이트 평가**: 원래 학습된 모델로 테스트 성능 평가
+  - **고정 게이트 평가**: `GateFixedModel` 래퍼를 적용하여 게이트를 평균값으로 고정한 후 평가
+  - **W5 지표 계산**: `compute_w5_metrics()`에 두 결과를 전달하여 비교 지표 계산
+  - **결과 병합**: 동적 모델 지표 + W5 비교 지표 + 고정 모델 개별 지표(rmse_fixed 등)
+- **효과**: 
+  - `w5_performance_degradation_ratio` 등 비교 지표가 정상적으로 계산됨
+  - CSV에 동적/고정 성능이 모두 기록되어 분석 용이
+  - `gate_fixed` 플래그 불필요 (run_tag에서 제거)
+
+#### 2. W5 지표 계산 로직 명확화
+- **파일**: `utils/experiment_metrics/w5_metrics.py`
+- **변경**: docstring 개선 및 지표 해석 추가
+- **상세**:
+  - **성능 저하율**: `(rmse_fixed - rmse_dynamic) / rmse_dynamic`
+    - 양수면 고정 시 성능 악화, 음수면 오히려 개선
+  - **민감도 손실**: `tod_dynamic - tod_fixed`
+    - 양수면 동적 게이트가 시간대 패턴을 더 잘 포착
+  - **이벤트 손실**: `event_gain_dynamic - event_gain_fixed`
+    - 양수면 동적 게이트가 이벤트를 더 잘 탐지
+  - **정렬 손실**: 게이트 변동성과 이벤트 게인의 곱 차이
+    - 동적 게이트는 이벤트 발생 시 크게 변동하지만, 고정 게이트는 변화 없음
+
+#### 3. 고정 모델 개별 지표 추가
+- **파일**: `experiments/w5_experiment.py`
+- **변경**: 고정 모델의 주요 성능 지표를 별도 키로 저장
+- **상세**:
+  - `rmse_fixed`: 고정 게이트 모델의 RMSE
+  - `mae_fixed`: 고정 게이트 모델의 MAE
+  - `gc_kernel_tod_dcor_fixed`: 고정 게이트 모델의 TOD 민감도
+  - `cg_event_gain_fixed`: 고정 게이트 모델의 이벤트 게인
+- **효과**: 절대값 비교 및 분석이 용이해짐
+
+#### 4. 테스트 및 검증
+- **신규 파일**: `docs/experiment_modifications/test_w5_modifications.py`
+- **테스트 항목**:
+  - `test_gate_fixed_model()`: GateFixedModel이 게이트를 올바르게 고정하는지 검증
+  - `test_w5_metrics_computation()`: W5 지표 계산 정확성 검증
+  - `test_w5_metrics_with_missing_data()`: 누락된 데이터 처리 검증
+  - `test_w5_evaluate_test_integration()`: evaluate_test 통합 로직 검증
+- **실행**: `python docs/experiment_modifications/test_w5_modifications.py`
+
+#### 5. 실험 실행 방식 변경
+- **이전**: `gate_fixed=False`와 `gate_fixed=True`로 두 번 실행 필요
+- **현재**: 한 번의 실행으로 동적과 고정 비교 완료
+- **run_tag**: `W5-dynamic` / `W5-fixed` → `W5`로 단순화
+- **CSV 출력**: 
+  - 동적 모델 지표 (rmse, mae, ...)
+  - 고정 모델 지표 (rmse_fixed, mae_fixed, ...)
+  - W5 비교 지표 (w5_performance_degradation_ratio, ...)
+
+---
+
 ### 2025-11-07: W4 실험 코드 개선 (평가 피드백 반영)
 
 #### 1. W4Experiment 개선

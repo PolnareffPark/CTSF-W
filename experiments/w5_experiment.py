@@ -74,25 +74,49 @@ class W5Experiment(BaseExperiment):
         return model
     
     def evaluate_test(self):
-        """게이트 고정 모드인 경우 래퍼 적용"""
-        if self.cfg.get("gate_fixed", False):
-            # 학습된 모델을 래핑하여 게이트 고정
-            fixed_model = GateFixedModel(self.model)
-            fixed_model.eval()
-            
-            # 고정 모델로 평가
-            from utils.direct_evidence import evaluate_with_direct_evidence
-            from data.dataset import build_test_tod_vector
-            
-            tod_vec = build_test_tod_vector(self.cfg)
-            direct = evaluate_with_direct_evidence(
-                fixed_model, self.test_loader, self.mu, self.std,
-                tod_vec=tod_vec, device=self.device
-            )
-            return direct
-        else:
-            return super().evaluate_test()
+        """동적 게이트와 고정 게이트를 모두 평가하여 비교"""
+        from utils.direct_evidence import evaluate_with_direct_evidence
+        from data.dataset import build_test_tod_vector
+        from utils.experiment_metrics.w5_metrics import compute_w5_metrics
+        
+        # TOD 벡터 준비
+        tod_vec = build_test_tod_vector(self.cfg)
+        
+        # 1. 동적 게이트 모드 평가 (원래 모델 그대로)
+        self.model.eval()
+        dynamic_results = evaluate_with_direct_evidence(
+            self.model, self.test_loader, self.mu, self.std,
+            tod_vec=tod_vec, device=self.device
+        )
+        
+        # 2. 게이트 고정 모드 평가
+        fixed_model = GateFixedModel(self.model)
+        fixed_model.eval()
+        fixed_results = evaluate_with_direct_evidence(
+            fixed_model, self.test_loader, self.mu, self.std,
+            tod_vec=tod_vec, device=self.device
+        )
+        
+        # 3. W5 특화 비교 지표 계산
+        w5_metrics = compute_w5_metrics(
+            self.model,
+            fixed_model_metrics=fixed_results,
+            dynamic_model_metrics=dynamic_results
+        )
+        
+        # 4. 결과 병합
+        # 동적 모델 결과를 기본으로 하고, W5 비교 지표 추가
+        # 고정 모델의 주요 지표도 별도로 기록
+        final_results = {**dynamic_results}
+        final_results.update(w5_metrics)
+        
+        # 고정 모델의 주요 성능 지표를 별도 키로 추가 (분석 용이성)
+        final_results['rmse_fixed'] = fixed_results.get('rmse', np.nan)
+        final_results['mae_fixed'] = fixed_results.get('mae', np.nan)
+        final_results['gc_kernel_tod_dcor_fixed'] = fixed_results.get('gc_kernel_tod_dcor', np.nan)
+        final_results['cg_event_gain_fixed'] = fixed_results.get('cg_event_gain', np.nan)
+        
+        return final_results
     
     def _get_run_tag(self):
-        gate_fixed = "fixed" if self.cfg.get("gate_fixed", False) else "dynamic"
-        return f"{self.dataset_tag}-h{self.cfg['horizon']}-s{self.cfg['seed']}-W5-{gate_fixed}"
+        return f"{self.dataset_tag}-h{self.cfg['horizon']}-s{self.cfg['seed']}-W5"

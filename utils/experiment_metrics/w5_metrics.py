@@ -13,22 +13,32 @@ def compute_w5_metrics(
     **kwargs
 ) -> Dict:
     """
-    W5 실험 특화 지표 계산
+    W5 실험 특화 지표 계산: 동적 게이트 vs 고정 게이트 비교
     
     Args:
+        model: 모델 객체 (현재는 미사용, 향후 확장용)
         fixed_model_metrics: 게이트 고정 모델의 지표
         dynamic_model_metrics: 동적 게이트 모델의 지표
     
     Returns:
         dict with keys:
         - w5_performance_degradation_ratio: 성능 저하율
+          (rmse_fixed - rmse_dynamic) / rmse_dynamic
+          양수면 고정 시 성능 악화, 음수면 오히려 개선
         - w5_sensitivity_gain_loss: 민감도 이득 손실
+          tod_dynamic - tod_fixed
+          양수면 동적 게이트가 시간대 패턴을 더 잘 포착
         - w5_event_gain_loss: 이벤트 이득 손실
+          event_gain_dynamic - event_gain_fixed
+          양수면 동적 게이트가 이벤트를 더 잘 탐지
         - w5_gate_event_alignment_loss: 게이트-이벤트 정렬 손실
+          동적 게이트는 이벤트 발생 시 크게 변동하지만,
+          고정 게이트는 변화 없음. 그 차이를 정량화
     """
     metrics = {}
     
     if dynamic_model_metrics is None or fixed_model_metrics is None:
+        # 둘 중 하나라도 없으면 비교 불가
         metrics["w5_performance_degradation_ratio"] = np.nan
         metrics["w5_sensitivity_gain_loss"] = np.nan
         metrics["w5_event_gain_loss"] = np.nan
