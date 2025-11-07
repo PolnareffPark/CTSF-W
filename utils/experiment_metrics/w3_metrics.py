@@ -97,19 +97,20 @@ def compute_w3_metrics(
             metrics["w3_intervention_cohens_d"] = np.nan
     
     # 순위 보존률: 교란 전후 성능 순위가 얼마나 유지되는지
+    # 참고: 순위 보존률은 여러 데이터셋/horizon 조합에서의 순위를 비교해야 정확히 계산 가능
+    # 현재는 단일 실험에 대해서만 처리하므로, 전체 실험 결과를 모은 후 별도로 계산해야 함
+    # 여기서는 교란 전후 RMSE 비율로 근사 계산
     if baseline_metrics is not None and hooks_data is not None:
-        # 간단히 RMSE 순위 보존률 계산
-        # 실제로는 여러 데이터셋/horizon 조합에서의 순위를 비교해야 하지만,
-        # 여기서는 현재 실험의 RMSE가 baseline 대비 순위가 유지되는지 확인
         current_rmse = hooks_data.get("rmse", np.nan) if hooks_data else np.nan
         baseline_rmse = baseline_metrics.get("rmse", np.nan)
         
-        if np.isfinite(current_rmse) and np.isfinite(baseline_rmse):
-            # RMSE가 낮을수록 좋으므로, 순위가 유지되려면 비율이 비슷해야 함
-            # 간단히: 교란 후 성능이 baseline 대비 비슷한 비율을 유지하면 순위 보존
-            # 실제 구현은 여러 실험 결과를 모아서 순위 비교를 해야 함
-            # 여기서는 임시로 1.0 (완전 보존) 또는 NaN으로 설정
-            metrics["w3_rank_preservation_rate"] = 1.0  # TODO: 실제 순위 비교 필요
+        if np.isfinite(current_rmse) and np.isfinite(baseline_rmse) and baseline_rmse > 0:
+            # RMSE 비율이 1에 가까우면 순위가 유지됨 (교란 영향이 적음)
+            # 비율이 크게 벗어나면 순위 변화 (교란 영향이 큼)
+            rmse_ratio = current_rmse / baseline_rmse
+            # 순위 보존률 = 1 - |1 - ratio| (1에 가까울수록 보존률 높음)
+            preservation = 1.0 - min(abs(1.0 - rmse_ratio), 1.0)
+            metrics["w3_rank_preservation_rate"] = float(preservation)
         else:
             metrics["w3_rank_preservation_rate"] = np.nan
     else:

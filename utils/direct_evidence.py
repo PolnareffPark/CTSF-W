@@ -31,8 +31,10 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
     if device is None:
         device = next(model.parameters()).device
 
-    # 경로 on/off 확인 (both 환경에서는 둘 다 True)
+    # 경로 on/off 확인
     # use_gc: GRU→Conv 경로, use_cg: Conv→GRU 경로
+    # both 환경에서는 모든 블록의 use_gc=True, use_cg=True이므로 둘 다 True가 됨
+    # 따라서 both 환경에서도 정상 작동함
     gc_on = any(getattr(blk, "use_gc", True) for blk in model.xhconv_blks)
     cg_on = any(getattr(blk, "use_cg", True) for blk in model.xhconv_blks)
 

@@ -8,12 +8,12 @@ import numpy as np
 from typing import Dict, Optional, List
 from utils.metrics import _dcor_u, _safe_corr
 try:
-    from utils.experiment_metrics.w1_metrics import _cka_similarity, _cca_similarity
+    from utils.experiment_metrics.w1_metrics import _cka_similarity
+    # _cca_similarity는 현재 사용하지 않지만 향후 사용 가능
+    from utils.experiment_metrics.w1_metrics import _cca_similarity  # noqa: F401
 except ImportError:
     # Fallback
     def _cka_similarity(X, Y):
-        return np.nan
-    def _cca_similarity(X, Y):
         return np.nan
 
 
