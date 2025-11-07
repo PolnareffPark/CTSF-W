@@ -143,7 +143,7 @@ class BaseExperiment:
         
         # 실험별 특화 지표 계산
         try:
-            from utils.experiment_specific_metrics import compute_experiment_specific_metrics
+            from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
             
             # W4의 경우 active_layers 정보 필요
             active_layers = []
@@ -160,7 +160,7 @@ class BaseExperiment:
                 elif cross_layers == "deep":
                     active_layers = list(range(depth - max(1, depth // 3), depth))
             
-            exp_specific = compute_experiment_specific_metrics(
+            exp_specific = compute_all_experiment_metrics(
                 experiment_type=self.experiment_type,
                 model=self.model,
                 hooks_data=None,  # TODO: hooks_data 수집 필요

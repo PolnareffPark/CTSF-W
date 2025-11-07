@@ -72,8 +72,8 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
         C_post = hooks.C_last_post
         R_post = hooks.R_last_post
 
-        # ---- Conv→GRU: 변화량 의존 지표들 ----
-        if (C_pre is not None) and (R_post is not None):
+        # ---- Conv→GRU: 변화량 의존 지표들 (cg_on일 때만 계산) ----
+        if cg_on and (C_pre is not None) and (R_post is not None):
             conv_d = _time_deriv_norm(C_pre)  # (B,T-1)
             gru_d = _time_deriv_norm(R_post)  # (B,T-1)
 
@@ -117,17 +117,26 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
     mse_real = float(((P - T) ** 2).mean())
     rmse = float(np.sqrt(mse_real))
 
-    # ---- Conv→GRU 요약 ----
+    # ---- Conv→GRU 요약 (cg_on일 때만 계산, 아니면 NaN) ----
     def _m(L):
         return float(np.mean(np.concatenate(L))) if L else float('nan')
 
-    cg_pearson_mean = _m(cg_p_list)
-    cg_spearman_mean = _m(cg_s_list)
-    cg_dcor_mean = _m(cg_dcor_list)
-    cg_event_gain = float(np.nanmean(gain_list)) if gain_list else np.nan
-    cg_event_hit = float(np.nanmean(hit_list)) if hit_list else np.nan
-    cg_maxcorr = float(np.nanmean(maxc_list)) if maxc_list else np.nan
-    cg_bestlag = float(np.nanmean(blag_list)) if blag_list else np.nan
+    if cg_on:
+        cg_pearson_mean = _m(cg_p_list)
+        cg_spearman_mean = _m(cg_s_list)
+        cg_dcor_mean = _m(cg_dcor_list)
+        cg_event_gain = float(np.nanmean(gain_list)) if gain_list else np.nan
+        cg_event_hit = float(np.nanmean(hit_list)) if hit_list else np.nan
+        cg_maxcorr = float(np.nanmean(maxc_list)) if maxc_list else np.nan
+        cg_bestlag = float(np.nanmean(blag_list)) if blag_list else np.nan
+    else:
+        cg_pearson_mean = np.nan
+        cg_spearman_mean = np.nan
+        cg_dcor_mean = np.nan
+        cg_event_gain = np.nan
+        cg_event_hit = np.nan
+        cg_maxcorr = np.nan
+        cg_bestlag = np.nan
 
     # ---- GRU→Conv 요약 (경로 off이면 NaN) ----
     gc_kernel_tod_dcor = np.nan
