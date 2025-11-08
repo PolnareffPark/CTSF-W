@@ -13,40 +13,54 @@ CTSF 모델의 Ablation Study를 위한 모듈화된 코드베이스입니다.
 
 ```
 .
-├── models/                      # 모델 정의
-│   ├── ctsf_model.py           # 기본 CTSF 모델 (절대 변경 금지)
-│   └── experiment_variants.py  # 실험별 변형
-├── data/                       # 데이터 로딩
+├── CHANGES_SUMMARY.md
+├── config/
+│   └── config.py
+├── CTSF-W-Overview.md
+├── data/
+│   ├── __init__.py
 │   └── dataset.py
-├── utils/                      # 유틸리티
-│   ├── metrics.py              # 평가 지표
-│   ├── hooks.py                # Forward/Backward hooks
-│   ├── direct_evidence.py      # 직접 근거 지표
-│   ├── training.py             # 학습/평가 함수
-│   ├── csv_logger.py           # CSV 저장
-│   ├── error_logger.py         # 오류 로깅
-│   ├── plot_results.py         # 보고용 그림 데이터 저장
-│   ├── plotting_metrics.py     # 보고용 그림 지표 계산
-│   └── experiment_metrics/     # 실험별 특화 지표
-│       ├── w1_metrics.py
-│       ├── w2_metrics.py
-│       ├── w3_metrics.py
-│       ├── w4_metrics.py
-│       ├── w5_metrics.py
-│       └── all_metrics.py
-├── experiments/                # 실험 실행 코드
-│   ├── base_experiment.py      # 기본 실험 클래스
+├── datasets/
+├── docs/
+│   ├── exp-plan/
+│   ├── experiment_modifications/
+│   ├── original-code/
+│   └── Papers/
+├── environment-check.ipynb
+├── experiments/
+│   ├── base_experiment.py
 │   ├── w1_experiment.py
 │   ├── w2_experiment.py
 │   ├── w3_experiment.py
 │   ├── w4_experiment.py
 │   └── w5_experiment.py
-├── config/                     # 설정 관리
-│   └── config.py
-├── main.py                     # 단일 실험 실행
-├── run_suite.py                # 실험 스위트 실행
-├── run_all_experiments.py      # 전체 실험 (W1~W5) 순차 실행
-└── hp2_config.yaml             # HP2 설정 파일
+├── hp2_config.yaml
+├── main.py
+├── models/
+│   ├── ctsf_model.py
+│   └── experiment_variants.py
+├── results/
+├── results_test/
+├── run_all_experiments.py
+├── run_suite.py
+├── test_single_experiments.py
+├── test_w3_feedback_fixes.py
+└── utils/
+    ├── csv_logger.py
+    ├── direct_evidence.py
+    ├── error_logger.py
+    ├── experiment_metrics/
+    │   ├── all_metrics.py
+    │   ├── w1_metrics.py
+    │   ├── w2_metrics.py
+    │   ├── w3_metrics.py
+    │   ├── w4_metrics.py
+    │   └── w5_metrics.py
+    ├── hooks.py
+    ├── metrics.py
+    ├── plot_results.py
+    ├── plotting_metrics.py
+    └── training.py
 ```
 
 ## 실험 개요
