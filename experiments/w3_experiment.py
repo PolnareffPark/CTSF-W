@@ -79,11 +79,8 @@ class W3Experiment(BaseExperiment):
         self.perturbation_kwargs = cfg.get("perturbation_kwargs", {})
         super().__init__(cfg)
         
-        # 학습 데이터로더에 교란 적용
-        if self.perturbation and self.perturbation != "none":
-            self.train_loader = PerturbedDataLoader(
-                self.train_loader, self.perturbation, self.dataset_tag, **self.perturbation_kwargs
-            )
+        # W3 실험은 동일한 모델(교란 없이 학습)로 테스트 데이터에만 교란 적용
+        # 따라서 학습 데이터에는 교란을 적용하지 않음
     
     def _create_model(self):
         # 기본 모델 사용
