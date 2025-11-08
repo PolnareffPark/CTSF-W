@@ -1,405 +1,301 @@
-# ===========================================
-# W1 전용 3종 패치 함수 (plot_results.py에서 import 해서 사용)
-# ===========================================
+# utils/experiment_plotting_metrics/w1_plotting_metrics.py
+# =====================================================================
+# 목적
+#   - W1(Per-layer Cross vs Last-layer Fusion) 전용 "그림 저장 로직" 제공
+#   - 각 그림은 summary + detail(long-form) 두 종류 CSV를 생성
+#   - 계산 함수는 기본적으로 all_plotting_metrics 에서 import 하여 실제 호출
+#
+# 의존
+#   - from utils.experiment_plotting_metrics.all_plotting_metrics import
+#       compute_layerwise_cka, compute_gradient_alignment, build_forest_from_results,
+#       append_or_update_row, append_or_update_long, REQUIRED_KEYS
+#
+# 사용 예시 (평가 루틴 내부)
+#   from utils.experiment_plotting_metrics.w1_plotting_metrics import (
+#       compute_and_save_w1_cka_heatmap,
+#       compute_and_save_w1_grad_align_bar,
+#       update_w1_forest_summary_and_detail
+#   )
+#
+#   base_ctx = {
+#     "experiment_type": "W1",
+#     "dataset": dataset_name,
+#     "horizon": int(CFG["horizon"]),
+#     "seed": int(CFG["seed"]),
+#     "mode": CFG["mode"],  # 'per_layer' or 'last_layer'
+#   }
+#
+#   # 1) CKA: (요약/상세 모두 저장)
+#   compute_and_save_w1_cka_heatmap(
+#       ctx={**base_ctx, "plot_type": "cka_heatmap"},
+#       feature_dict=feature_dict,                 # {'cnn':[...], 'gru':[...]} 형태
+#       out_dir=f"results_W1/{dataset_name}/cka_heatmap"
+#   )
+#
+#   # 2) Grad-Align: (요약/상세 모두 저장)
+#   compute_and_save_w1_grad_align_bar(
+#       ctx={**base_ctx, "plot_type": "grad_align_bar"},
+#       grad_dict=grad_dict,                      # {'cnn':[grad_l], 'gru':[grad_l]} 형태
+#       out_dir=f"results_W1/{dataset_name}/grad_align_bar"
+#   )
+#
+#   # 3) Forest: (요약/상세 동시 생성; W1 전체 실행 로그를 기반으로 Δ/TopPick 산출)
+#   update_w1_forest_summary_and_detail(
+#       results_w1_csv="results_W1.csv",
+#       out_dir=f"results_W1/{dataset_name}/forest_plot"
+#   )
+#
+# =====================================================================
+
 from __future__ import annotations
 from pathlib import Path
-import pandas as pd
+from typing import Dict, Any, Optional
+
 import numpy as np
-import json
-import os
-from typing import Dict, Any, List
 
-# ---------------------------
-# 공통 유틸
-# ---------------------------
-
-"""
-위치 권장: utils/plot_results.py (또는 별도 모듈로 추가 후 plot_results.py에서 import)
-
-목적: (1) CKA Heatmap(요약+상세), (2) Grad‑Align Bar(요약+상세), (3) Forest Plot(Δ 비교+Top‑pick 점수) 저장을 스키마에 맞춰 기록
-
-키(필수): experiment_type, dataset, plot_type, horizon, seed, mode
-
-모든 함수는 append‑only + 중복 제거(키 기준) 방식으로 덮어쓰기 저장합니다.
-
-주의: CKA/Grad‑Align 요약 계산은 plotting_metrics에서 제공하는 메트릭에 의존합니다.
-‑ CKA: cka_matrix(np.ndarray or list of lists), (선택) cnn_depth_bins, gru_depth_bins
-‑ Grad‑Align: grad_align_by_layer(list of {layer_idx, depth_bin, grad_align_value}) 또는 요약치
-"""
-
-"""
-사용 예시
-
-CKA Heatmap 저장 (W1 실행 1회의 평가 후)
-
-# ctx 예시
-ctx = {
-  "experiment_type": "W1",
-  "dataset": dataset_name,
-  "plot_type": "cka_heatmap",
-  "horizon": int(CFG["horizon"]),
-  "seed": int(CFG["seed"]),
-  "mode": CFG["mode"]  # 'per_layer' or 'last_layer'
-}
-# metrics는 plotting_metrics.compute_layerwise_cka() 결과 dict
-save_w1_cka_heatmap(ctx, metrics, out_dir=f"results_W1/{dataset_name}/cka_heatmap")
-
----
-
-Grad-Align Bar 저장
-
-ctx["plot_type"] = "grad_align_bar"
-# metrics는 plotting_metrics.compute_gradient_alignment() 결과 dict
-save_w1_grad_align_bar(ctx, metrics, out_dir=f"results_W1/{dataset_name}/grad_align_bar")
-
----
-
-Forest Plot 요약(Δ + Top‑pick) 업데이트
-(W1 모든 실행이 results_W1.csv에 쌓이는 구조라면, 각 실행 저장 직후 또는 데이터셋/호라이즌 단위로 주기적 호출)
-
-update_w1_forest_summary_from_results(
-    results_w1_csv="results_W1.csv",
-    out_csv=f"results_W1/{dataset_name}/forest_plot/forest_plot_summary.csv"
+from utils.experiment_plotting_metrics.all_plotting_metrics import (
+    REQUIRED_KEYS,
+    append_or_update_row, append_or_update_long,
+    compute_layerwise_cka, compute_gradient_alignment,
+    build_forest_from_results
 )
 
-"""
+# -------------------------------
+# 내부 유틸
+# -------------------------------
 
+def _split_bins_auto(n_layers: int):
+    if n_layers <= 0: return []
+    b1 = int(np.floor(n_layers/3))
+    b2 = int(np.floor(2*n_layers/3))
+    return ["S" if i < b1 else "M" if i < b2 else "D" for i in range(n_layers)]
 
-_W1_KEYS = ["experiment_type","dataset","plot_type","horizon","seed","mode"]
-
-def _ensure_dir(p: Path) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-def _atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
-    _ensure_dir(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_csv(tmp, index=False)
-    tmp.replace(path)
-
-def _append_or_update_row(path: Path, row: Dict[str, Any], subset_keys: List[str]) -> None:
-    _ensure_dir(path)
-    row_df = pd.DataFrame([row])
-    if path.exists():
-        df = pd.read_csv(path)
-        # drop old rows with same subset
-        mask = np.ones(len(df), dtype=bool)
-        for k in subset_keys:
-            mask &= (df[k] == row[k])
-        df = pd.concat([df[~mask], row_df], ignore_index=True)
-    else:
-        df = row_df
-    _atomic_write_csv(df, path)
-
-def _append_or_update_long(path: Path, rows: List[Dict[str, Any]], subset_keys: List[str]) -> None:
-    if not rows:
-        return
-    _ensure_dir(path)
-    new_df = pd.DataFrame(rows)
-    if path.exists():
-        old = pd.read_csv(path)
-        df = pd.concat([old, new_df], ignore_index=True)
-        df.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
-    else:
-        df = new_df
-    _atomic_write_csv(df, path)
-
-def _split_bins_auto(n_layers: int) -> List[str]:
-    """레이어 수만 알고 S/M/D 구간을 균등 분할 라벨로 생성."""
-    if n_layers <= 0:
-        return []
-    # 3등분 라벨
-    borders = [int(np.floor(n_layers/3)), int(np.floor(2*n_layers/3))]
-    bins = []
-    for i in range(n_layers):
-        if i < borders[0]:
-            bins.append("S")
-        elif i < borders[1]:
-            bins.append("M")
-        else:
-            bins.append("D")
-    return bins
-
-def _safe_float(x, default=np.nan):
+def _nanmean(a) -> float:
+    import numpy as _np
     try:
-        v = float(x)
-        if np.isfinite(v):
-            return v
-        return default
+        return float(_np.nanmean(a))
     except Exception:
-        return default
+        return _np.nan
 
-def _nanmean(a):
-    try:
-        return float(np.nanmean(a))
-    except Exception:
-        return np.nan
-
-def _zscore(series: pd.Series) -> pd.Series:
-    s = series.astype(float)
-    m = s.mean()
-    sd = s.std(ddof=0)
-    if not np.isfinite(sd) or sd == 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - m) / sd
 
 # =======================================================
-# 1) W1 - CKA Heatmap (summary + detail)
+# (A) CKA Heatmap (summary + detail)
 # =======================================================
+
+def compute_and_save_w1_cka_heatmap(
+    ctx: Dict[str, Any],
+    feature_dict: Dict[str, Any],
+    out_dir: str | Path,
+    depth_bins_cnn=None, depth_bins_gru=None, max_samples: Optional[int] = 20000
+) -> None:
+    """all_plotting_metrics의 compute_layerwise_cka를 실제 호출하여 저장까지 수행."""
+    metrics = compute_layerwise_cka(
+        feature_dict=feature_dict,
+        cnn_key="cnn", gru_key="gru",
+        max_samples=max_samples,
+        depth_bins_cnn=depth_bins_cnn, depth_bins_gru=depth_bins_gru
+    )
+    save_w1_cka_heatmap(ctx, metrics, out_dir)
 
 def save_w1_cka_heatmap(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir: str | Path) -> None:
-    """
-    ctx: {experiment_type, dataset, plot_type='cka_heatmap', horizon, seed, mode, ...}
-    metrics: plotting_metrics.compute_layerwise_cka() 반환 내용을 포함해야 함.
-      - 필수: 'cka_matrix' (2D array-like)
-      - 선택: 'cnn_depth_bins', 'gru_depth_bins' (없으면 자동 균등분할)
-    out_dir: results_W1/<dataset>/cka_heatmap 디렉토리
-    """
+    """이미 계산된 metrics(cka_matrix 등)를 받아 summary/detail을 저장."""
     out_dir = Path(out_dir)
     summary_csv = out_dir / "cka_heatmap_summary.csv"
     detail_csv  = out_dir / "cka_heatmap_detail.csv"
 
-    # 1) 행렬 확보
     if "cka_matrix" not in metrics:
-        # 행렬이 없으면 summary 스킵(빈 행 저장 X) — detail도 없음
         return
+
     M = np.array(metrics["cka_matrix"], dtype=float)
     Lc, Lg = M.shape if M.ndim == 2 else (0, 0)
+    if Lc == 0 or Lg == 0:
+        return
 
-    # 2) 레이어 라벨
-    cnn_layers = list(range(Lc))
-    gru_layers = list(range(Lg))
     cnn_bins = metrics.get("cnn_depth_bins") or _split_bins_auto(Lc)
     gru_bins = metrics.get("gru_depth_bins") or _split_bins_auto(Lg)
 
-    # 3) 요약치 계산
+    # 요약치
     full_mean = _nanmean(M)
-    diag_mean = _nanmean(np.diag(M)) if Lc == Lg and Lc > 0 else full_mean
-    # 밴드별(S/M/D) 평균: 동일 밴드 조합만 취득(S-S, M-M, D-D)
+    diag_mean = _nanmean(np.diag(M)) if Lc == Lg else full_mean
+
     def _band_mean(band: str) -> float:
         idx_c = [i for i,b in enumerate(cnn_bins) if b == band]
         idx_g = [j for j,b in enumerate(gru_bins) if b == band]
-        if not idx_c or not idx_g:
-            return np.nan
-        sub = M[np.ix_(idx_c, idx_g)]
-        return _nanmean(sub)
-    cka_s = _band_mean("S")
-    cka_m = _band_mean("M")
-    cka_d = _band_mean("D")
-    nan_frac = float(np.isnan(M).sum()) / float(M.size) if M.size > 0 else 0.0
+        if not idx_c or not idx_g: return np.nan
+        return _nanmean(M[np.ix_(idx_c, idx_g)])
 
-    # 4) summary 저장(한 행)
+    cka_s = _band_mean("S"); cka_m = _band_mean("M"); cka_d = _band_mean("D")
+    nan_frac = float(np.isnan(M).sum()) / float(M.size)
+
+    # summary 저장
     row = {
-        **{k: ctx[k] for k in _W1_KEYS if k in ctx},
+        **{k: ctx.get(k) for k in REQUIRED_KEYS if k in ctx},
         "depth_cnn": Lc, "depth_gru": Lg,
         "cka_s": cka_s, "cka_m": cka_m, "cka_d": cka_d,
-        "cka_diag_mean": diag_mean,
-        "cka_full_mean": full_mean,
-        "n_pairs": int(M.size),
-        "nan_frac": nan_frac
+        "cka_diag_mean": diag_mean, "cka_full_mean": full_mean,
+        "n_pairs": int(M.size), "nan_frac": nan_frac
     }
-    _append_or_update_row(summary_csv, row, subset_keys=_W1_KEYS)
+    append_or_update_row(summary_csv, row, subset_keys=REQUIRED_KEYS)
 
-    # 5) detail 저장(long): 상삼각만 저장(중복 절감)
+    # detail 저장 (long-form, 상삼각만)
     rows = []
     for i in range(Lc):
         for j in range(i, Lg):
             v = M[i, j]
-            if not np.isfinite(v):
-                continue
-            rows.append({
-                **{k: ctx[k] for k in _W1_KEYS if k in ctx},
-                "cnn_layer": i, "gru_layer": j,
-                "cnn_depth_bin": cnn_bins[i] if i < len(cnn_bins) else "",
-                "gru_depth_bin": gru_bins[j] if j < len(gru_bins) else "",
-                "cka_value": round(float(v), 6)
-            })
-    _append_or_update_long(
-        detail_csv, rows,
-        subset_keys=_W1_KEYS + ["cnn_layer","gru_layer"]
-    )
+            if np.isfinite(v):
+                rows.append({
+                    **{k: ctx.get(k) for k in REQUIRED_KEYS if k in ctx},
+                    "cnn_layer": i, "gru_layer": j,
+                    "cnn_depth_bin": cnn_bins[i], "gru_depth_bin": gru_bins[j],
+                    "cka_value": round(float(v), 6)
+                })
+    append_or_update_long(detail_csv, rows, subset_keys=REQUIRED_KEYS+["cnn_layer","gru_layer"])
+
 
 # =======================================================
-# 2) W1 - Grad-Align Bar (summary + detail)
+# (B) Grad-Align Bar (summary + detail)
 # =======================================================
+
+def compute_and_save_w1_grad_align_bar(
+    ctx: Dict[str, Any],
+    grad_dict: Dict[str, Any],
+    out_dir: str | Path,
+    depth_bins=None
+) -> None:
+    """all_plotting_metrics의 compute_gradient_alignment를 실제 호출하여 저장까지 수행."""
+    metrics = compute_gradient_alignment(
+        grad_dict=grad_dict,
+        cnn_key="cnn", gru_key="gru",
+        depth_bins=depth_bins
+    )
+    save_w1_grad_align_bar(ctx, metrics, out_dir)
 
 def save_w1_grad_align_bar(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir: str | Path) -> None:
-    """
-    ctx: {experiment_type, dataset, plot_type='grad_align_bar', horizon, seed, mode, ...}
-    metrics: plotting_metrics.compute_gradient_alignment() 결과(권장)
-      - 권장: 'grad_align_by_layer' = [{layer_idx, depth_bin, grad_align_value}, ...]
-      - 선택: 'grad_align_s','grad_align_m','grad_align_d','grad_align_mean'
-    out_dir: results_W1/<dataset>/grad_align_bar
-    """
+    """이미 계산된 metrics(grad_align_by_layer 등)를 받아 summary/detail을 저장."""
     out_dir = Path(out_dir)
     summary_csv = out_dir / "grad_align_bar_summary.csv"
     detail_csv  = out_dir / "grad_align_bar_detail.csv"
 
-    # 1) detail 우선 (있으면 summary도 계산 가능)
     detail = metrics.get("grad_align_by_layer", None)
     s_mean = metrics.get("grad_align_s", None)
     m_mean = metrics.get("grad_align_m", None)
     d_mean = metrics.get("grad_align_d", None)
     all_mean = metrics.get("grad_align_mean", None)
 
-    # detail이 있으면 long 저장
+    # detail 저장
+    rows = []
     if isinstance(detail, (list, tuple)) and len(detail) > 0:
-        rows = []
         for item in detail:
             if isinstance(item, dict):
                 li = int(item.get("layer_idx", -1))
                 db = str(item.get("depth_bin", ""))
-                gv = _safe_float(item.get("grad_align_value", np.nan))
+                gv = float(item.get("grad_align_value", np.nan))
             else:
-                # (layer_idx, depth_bin, grad) 형태도 허용
                 try:
-                    li = int(item[0]); db = str(item[1]); gv = _safe_float(item[2])
+                    li = int(item[0]); db = str(item[1]); gv = float(item[2])
                 except Exception:
                     continue
-            if not np.isfinite(gv):
-                continue
+            if not np.isfinite(gv): continue
             rows.append({
-                **{k: ctx[k] for k in _W1_KEYS if k in ctx},
+                **{k: ctx.get(k) for k in REQUIRED_KEYS if k in ctx},
                 "layer_idx": li, "depth_bin": db,
-                "grad_align_value": round(float(gv), 6)
+                "grad_align_value": round(gv, 6)
             })
-        _append_or_update_long(
-            detail_csv, rows,
-            subset_keys=_W1_KEYS + ["layer_idx"]
-        )
-        # detail로부터 요약 재계산(필요 시)
+        append_or_update_long(detail_csv, rows, subset_keys=REQUIRED_KEYS+["layer_idx"])
+
+        # summary 재계산(필요시)
         try:
+            import pandas as pd
             df = pd.DataFrame(rows)
-            s_val = df.loc[df["depth_bin"]=="S","grad_align_value"].mean()
-            m_val = df.loc[df["depth_bin"]=="M","grad_align_value"].mean()
-            d_val = df.loc[df["depth_bin"]=="D","grad_align_value"].mean()
-            all_val = df["grad_align_value"].mean()
-            if s_mean is None: s_mean = _safe_float(s_val)
-            if m_mean is None: m_mean = _safe_float(m_val)
-            if d_mean is None: d_mean = _safe_float(d_val)
-            if all_mean is None: all_mean = _safe_float(all_val)
+            if s_mean is None:
+                s_mean = float(df.loc[df["depth_bin"]=="S","grad_align_value"].mean())
+            if m_mean is None:
+                m_mean = float(df.loc[df["depth_bin"]=="M","grad_align_value"].mean())
+            if d_mean is None:
+                d_mean = float(df.loc[df["depth_bin"]=="D","grad_align_value"].mean())
+            if all_mean is None:
+                all_mean = float(df["grad_align_value"].mean())
         except Exception:
             pass
 
-    # 2) summary 저장(한 행)
+    # summary 저장
     row = {
-        **{k: ctx[k] for k in _W1_KEYS if k in ctx},
-        "grad_align_s": _safe_float(s_mean),
-        "grad_align_m": _safe_float(m_mean),
-        "grad_align_d": _safe_float(d_mean),
-        "grad_align_mean": _safe_float(all_mean)
+        **{k: ctx.get(k) for k in REQUIRED_KEYS if k in ctx},
+        "grad_align_s": s_mean if s_mean is not None else np.nan,
+        "grad_align_m": m_mean if m_mean is not None else np.nan,
+        "grad_align_d": d_mean if d_mean is not None else np.nan,
+        "grad_align_mean": all_mean if all_mean is not None else np.nan
     }
-    _append_or_update_row(summary_csv, row, subset_keys=_W1_KEYS)
+    append_or_update_row(summary_csv, row, subset_keys=REQUIRED_KEYS)
+
 
 # =======================================================
-# 3) W1 - Forest Plot (Δ 비교 + Top-pick 점수)
+# (C) Forest Plot (Δ summary + detail)
 # =======================================================
 
-def update_w1_forest_summary_from_results(
-    results_w1_csv: str | Path,
-    out_csv: str | Path
+def update_w1_forest_summary_and_detail(results_w1_csv: str | Path, out_dir: str | Path) -> None:
+    """
+    W1 전체 실행 로그(results_W1.csv)를 읽어,
+    같은 (dataset,horizon,seed)의 per_layer vs last_layer를 조인해
+    Δ지표(성능/CKA/GradAlign)와 Top-pick 점수를 산출 → forest_plot_summary.csv,
+    비교 쌍(tidy, long-form) → forest_plot_detail.csv 갱신.
+    """
+    build_forest_from_results(
+        experiment_type="W1",
+        results_csv=results_w1_csv,
+        out_dir=out_dir,
+        per_mode="per_layer",
+        last_mode="last_layer",
+        rmse_col_pref=("rmse_real","rmse"),
+        cka_col="cka_full_mean",
+        grad_col="grad_align_mean"
+    )
+
+
+# =======================================================
+# (D) 번들 호출 (한 번에 W1 3종 저장)
+# =======================================================
+
+def save_w1_figures_bundle(
+    dataset: str, horizon: int, seed: int, mode: str,
+    feature_dict: Optional[Dict[str, Any]] = None,      # CKA 계산용
+    grad_dict: Optional[Dict[str, Any]] = None,         # Grad-Align 계산용
+    results_w1_csv: Optional[str | Path] = None,
+    results_out_root: str | Path = "results_W1"
 ) -> None:
     """
-    results_W1.csv를 읽어, 같은 (dataset,horizon,seed)의 per_layer vs last_layer를 조인해
-    Δ 지표(성능/CKA/GradAlign)와 Top-pick 점수를 산출 → forest_plot_summary.csv 갱신.
-
-    * 전제: results_W1.csv 안에 다음 컬럼이 존재하는 것이 이상적.
-      - rmse_real (or rmse), mae_real (선택)
-      - cka_full_mean (save_w1_cka_heatmap가 summary에 저장)
-      - grad_align_mean (save_w1_grad_align_bar가 summary에 저장)
-
-    동작:
-      1) results_W1.csv 로드
-      2) mode=='per_layer' vs mode=='last_layer' 조인
-      3) Δ 계산: (last - per) 또는 (per - last)는 아래 일관 규칙 적용
-         - ΔRMSE(개선) = (rmse_last - rmse_per)  => 값이 클수록 per가 좋음
-         - ΔCKA        = (cka_full_mean_per - cka_full_mean_last)
-         - ΔGradAlign  = (grad_align_mean_per - grad_align_mean_last)
-         - ΔRMSE_pct   = (rmse_last - rmse_per) / rmse_last * 100
-      4) (dataset,horizon) 그룹 내 z-score 정규화 후 TopPick_W1 = z(ΔRMSE_pct)+z(ΔCKA)+z(ΔGradAlign)
-      5) out_csv에 저장(전체 재작성; 동일 키 덮어쓰기)
+    한 번의 평가(run)에서 W1 그림 3종을 한꺼번에 저장.
+    - feature_dict 존재 시: CKA(summary/detail) 생성
+    - grad_dict    존재 시: Grad-Align(summary/detail) 생성
+    - results_w1_csv 존재 시: Forest(summary/detail) 갱신
     """
-    results_w1_csv = Path(results_w1_csv)
-    out_csv = Path(out_csv)
-    if not results_w1_csv.exists():
-        return
-    df = pd.read_csv(results_w1_csv)
+    base_ctx = {
+        "experiment_type": "W1",
+        "dataset": dataset,
+        "horizon": int(horizon),
+        "seed": int(seed),
+        "mode": mode
+    }
 
-    if "rmse_real" not in df.columns:
-        if "rmse" in df.columns:
-            df["rmse_real"] = df["rmse"]
-        else:
-            return
+    # 1) CKA
+    if feature_dict is not None:
+        compute_and_save_w1_cka_heatmap(
+            ctx={**base_ctx, "plot_type": "cka_heatmap"},
+            feature_dict=feature_dict,
+            out_dir=Path(results_out_root)/dataset/"cka_heatmap"
+        )
 
-    # 필수 하위셋
-    req_cols = ["dataset","horizon","seed","mode","rmse_real"]
-    for c in req_cols:
-        if c not in df.columns:
-            return
+    # 2) Grad-Align
+    if grad_dict is not None:
+        compute_and_save_w1_grad_align_bar(
+            ctx={**base_ctx, "plot_type": "grad_align_bar"},
+            grad_dict=grad_dict,
+            out_dir=Path(results_out_root)/dataset/"grad_align_bar"
+        )
 
-    # per/last 분리 후 조인
-    per = df[df["mode"]=="per_layer"].copy()
-    last = df[df["mode"]=="last_layer"].copy()
-    if len(per)==0 or len(last)==0:
-        # 아직 한쪽이 없으면 skip
-        return
-
-    join_keys = ["dataset","horizon","seed"]
-    base = per.merge(last, on=join_keys, suffixes=("_per","_last"))
-
-    # Δ 계산
-    def _col_or_nan(name):
-        return name if name in base.columns else None
-
-    base["delta_rmse"] = base["rmse_real_last"] - base["rmse_real_per"]
-    base["delta_rmse_pct"] = 100.0 * base["delta_rmse"] / base["rmse_real_last"]
-
-    cka_per  = _col_or_nan("cka_full_mean_per")
-    cka_last = _col_or_nan("cka_full_mean_last")
-    if cka_per and cka_last:
-        base["delta_cka_global"] = base[cka_per] - base[cka_last]
-    else:
-        base["delta_cka_global"] = np.nan
-
-    ga_per  = _col_or_nan("grad_align_mean_per")
-    ga_last = _col_or_nan("grad_align_mean_last")
-    if ga_per and ga_last:
-        base["delta_grad_align_all"] = base[ga_per] - base[ga_last]
-    else:
-        base["delta_grad_align_all"] = np.nan
-
-    # Top-pick 점수 (무가중치 z-합; 그룹=dataset×horizon)
-    grouped_frames = []
-    for (_, grp) in base.groupby(["dataset", "horizon"], group_keys=False):
-        grp = grp.copy()
-        z_rmse = _zscore(grp["delta_rmse_pct"])
-        z_cka = _zscore(grp["delta_cka_global"]) if "delta_cka_global" in grp else pd.Series(0, index=grp.index)
-        z_gal = _zscore(grp["delta_grad_align_all"]) if "delta_grad_align_all" in grp else pd.Series(0, index=grp.index)
-        score = z_rmse
-        if z_cka is not None:
-            score = score + z_cka
-        if z_gal is not None:
-            score = score + z_gal
-        grp["top_pick_score_w1"] = score
-        grouped_frames.append(grp)
-
-    if grouped_frames:
-        base = pd.concat(grouped_frames, ignore_index=True)
-    else:
-        base = base.assign(top_pick_score_w1=np.nan)
-
-    # forest summary 스키마 정리
-    forest_cols = [
-        "dataset","horizon","seed",
-        "rmse_real_per","rmse_real_last",
-        "delta_rmse","delta_rmse_pct",
-        "delta_cka_global","delta_grad_align_all",
-        "top_pick_score_w1"
-    ]
-    # 존재하지 않을 수도 있는 컬럼은 제거
-    forest_cols = [c for c in forest_cols if c in base.columns]
-    forest = base[forest_cols].copy()
-    forest.insert(0, "experiment_type", "W1")
-    forest.insert(1, "plot_type", "forest_plot")
-
-    # 저장(전체 재작성; 덮어쓰기)
-    _atomic_write_csv(forest, out_csv)
+    # 3) Forest
+    if results_w1_csv is not None:
+        update_w1_forest_summary_and_detail(
+            results_w1_csv=results_w1_csv,
+            out_dir=Path(results_out_root)/dataset/"forest_plot"
+        )
