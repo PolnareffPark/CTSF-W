@@ -204,7 +204,7 @@ python test_single_experiments.py
 - W2: `dynamic`, `static`
 - W3: `none`, `tod_shift`, `smooth`
 - W4: `all`, `shallow`, `mid`, `deep`
-- W5: `dynamic`, `fixed`
+- W5: `dynamic`, `fixed` (한 번에 실행되므로 모드 설정은 필요 없음)
 
 **결과 저장**: 테스트 결과는 `results_test/` 폴더에 저장됩니다.
 
