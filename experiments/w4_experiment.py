@@ -20,16 +20,20 @@ class W4Experiment(BaseExperiment):
             # 모든 층 활성화
             active_layers = list(range(depth))
         elif cross_layers == "shallow":
-            # 얕은 층만 (예: 처음 1/3)
+            # 얕은 층만 (처음 1/3)
+            # depth=8 → [0,1], depth=9 → [0,1,2]
             n = max(1, depth // 3)
             active_layers = list(range(n))
         elif cross_layers == "mid":
-            # 중간 층만 (예: 중간 1/3)
-            n = max(1, depth // 3)
-            start = depth // 3
-            active_layers = list(range(start, start + n))
+            # 중간 층만 (전체 중간 영역)
+            # depth=8 → [2,3,4,5], depth=9 → [3,4,5], depth=7 → [2,3,4]
+            # shallow와 deep을 제외한 모든 중간 층을 포함
+            shallow_end = max(1, depth // 3)
+            deep_start = depth - max(1, depth // 3)
+            active_layers = list(range(shallow_end, deep_start))
         elif cross_layers == "deep":
-            # 깊은 층만 (예: 마지막 1/3)
+            # 깊은 층만 (마지막 1/3)
+            # depth=8 → [6,7], depth=9 → [6,7,8]
             n = max(1, depth // 3)
             active_layers = list(range(depth - n, depth))
         else:

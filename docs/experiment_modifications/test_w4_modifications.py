@@ -10,10 +10,59 @@ from experiments.w4_experiment import W4Experiment
 from models.ctsf_model import HybridTS
 
 
+def test_layer_coverage():
+    """모든 depth에서 shallow/mid/deep이 전체 층을 커버하는지 테스트"""
+    print("=" * 80)
+    print("테스트 1: 층 커버리지 검증 (개선된 로직)")
+    print("=" * 80)
+    
+    test_depths = [6, 7, 8, 9, 10, 12]
+    
+    for depth in test_depths:
+        # Shallow 계산
+        n = max(1, depth // 3)
+        shallow = list(range(n))
+        
+        # Mid 계산 (개선된 로직)
+        shallow_end = max(1, depth // 3)
+        deep_start = depth - max(1, depth // 3)
+        mid = list(range(shallow_end, deep_start))
+        
+        # Deep 계산
+        n = max(1, depth // 3)
+        deep = list(range(depth - n, depth))
+        
+        # 전체 커버된 층
+        covered = set(shallow + mid + deep)
+        all_layers = set(range(depth))
+        
+        missing = all_layers - covered
+        overlapping = []
+        for i in range(depth):
+            count = (i in shallow) + (i in mid) + (i in deep)
+            if count > 1:
+                overlapping.append(i)
+        
+        status = "✓" if len(missing) == 0 and len(overlapping) == 0 else "✗"
+        
+        print(f"\n  depth={depth}: {status}")
+        print(f"    shallow:  {shallow}")
+        print(f"    mid:      {mid}")
+        print(f"    deep:     {deep}")
+        
+        if missing:
+            print(f"    ⚠️  누락된 층: {sorted(missing)}")
+        if overlapping:
+            print(f"    ⚠️  중복된 층: {overlapping}")
+        
+        if len(missing) == 0 and len(overlapping) == 0:
+            print(f"    ✓ 모든 층이 정확히 한 범주에 속함")
+
+
 def test_w4_active_layers():
     """active_layers 속성이 올바르게 설정되는지 테스트"""
-    print("=" * 80)
-    print("테스트 1: active_layers 속성 확인")
+    print("\n" + "=" * 80)
+    print("테스트 2: active_layers 속성 확인")
     print("=" * 80)
     
     base_cfg = load_config("hp2_config.yaml")
@@ -51,9 +100,10 @@ def test_w4_active_layers():
                 n = max(1, actual_depth // 3)
                 expected_layers = list(range(n))
             elif cross_layers_mode == "mid":
-                n = max(1, actual_depth // 3)
-                start = actual_depth // 3
-                expected_layers = list(range(start, start + n))
+                # 전체 중간 영역 포함 (개선된 로직)
+                shallow_end = max(1, actual_depth // 3)
+                deep_start = actual_depth - max(1, actual_depth // 3)
+                expected_layers = list(range(shallow_end, deep_start))
             elif cross_layers_mode == "deep":
                 n = max(1, actual_depth // 3)
                 expected_layers = list(range(actual_depth - n, actual_depth))
@@ -72,7 +122,7 @@ def test_w4_active_layers():
 def test_w4_hooks_structure():
     """중간층 표현 수집 구조가 올바른지 테스트"""
     print("\n" + "=" * 80)
-    print("테스트 2: 중간층 표현 수집 구조 확인")
+    print("테스트 3: 중간층 표현 수집 구조 확인")
     print("=" * 80)
     
     # 가상의 hooks_data 생성
@@ -129,7 +179,7 @@ def test_w4_hooks_structure():
 def test_w4_metrics_computation():
     """W4 지표 계산이 올바른지 테스트"""
     print("\n" + "=" * 80)
-    print("테스트 3: W4 지표 계산 확인")
+    print("테스트 4: W4 지표 계산 확인")
     print("=" * 80)
     
     from utils.experiment_metrics.w4_metrics import compute_w4_metrics
@@ -200,6 +250,7 @@ def main():
     print()
     
     try:
+        test_layer_coverage()
         test_w4_active_layers()
         test_w4_hooks_structure()
         test_w4_metrics_computation()
