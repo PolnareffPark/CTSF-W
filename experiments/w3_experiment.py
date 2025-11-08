@@ -189,7 +189,9 @@ class W3Experiment(BaseExperiment):
                 print(f"[W3] Intervention effect (ΔRMSE%): {exp_specific['w3_intervention_effect_rmse']*100:.2f}%")
             if 'w3_intervention_cohens_d' in exp_specific:
                 print(f"[W3] Cohen's d_z: {exp_specific['w3_intervention_cohens_d']:.4f}")
-            if 'w3_rmse_win_rate' in exp_specific:
-                print(f"[W3] Win-rate (교란>기준): {exp_specific['w3_rmse_win_rate']*100:.1f}%")
+            if 'w3_rank_preservation_rate' in exp_specific:
+                print(f"[W3] Rank preservation (교란>기준): {exp_specific['w3_rank_preservation_rate']*100:.1f}%")
+            if 'w3_lag_distribution_change' in exp_specific:
+                print(f"[W3] Lag distribution change: {exp_specific['w3_lag_distribution_change']:.4f}")
         
         return current_direct

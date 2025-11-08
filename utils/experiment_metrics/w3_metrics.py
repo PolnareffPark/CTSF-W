@@ -94,7 +94,8 @@ def compute_w3_metrics(
         - w3_intervention_effect_tod: ΔTOD (절대 차이)
         - w3_intervention_effect_peak: ΔPeak (절대 차이)
         - w3_intervention_cohens_d: Paired Cohen's d_z
-        - w3_rmse_win_rate: P(perturbed > baseline)
+        - w3_rank_preservation_rate: P(perturbed > baseline) - 순위 보존률
+        - w3_lag_distribution_change: 라그 분포 변화
         - w3_cohens_d_ci_low, w3_cohens_d_ci_high: CI (선택적)
     """
     out = {}
@@ -145,8 +146,8 @@ def compute_w3_metrics(
             dz = paired_cohens_dz(diff)
             out['w3_intervention_cohens_d'] = dz
             
-            # Win-rate: 직관적 유의성 신호
-            out['w3_rmse_win_rate'] = float(np.mean(win_errors_pert > win_errors_base))
+            # 순위 보존률: P(perturbed > baseline) = 교란으로 악화된 비율
+            out['w3_rank_preservation_rate'] = float(np.mean(win_errors_pert > win_errors_base))
             
             # 선택적 부트스트랩 CI
             if dz_ci:
@@ -160,16 +161,26 @@ def compute_w3_metrics(
                 out['w3_cohens_d_ci_high'] = hi
         else:
             out['w3_intervention_cohens_d'] = np.nan
-            out['w3_rmse_win_rate'] = np.nan
+            out['w3_rank_preservation_rate'] = np.nan
             if dz_ci:
                 out['w3_cohens_d_ci_low'] = np.nan
                 out['w3_cohens_d_ci_high'] = np.nan
     else:
         # 윈도우별 오차가 없으면 NaN
         out['w3_intervention_cohens_d'] = np.nan
-        out['w3_rmse_win_rate'] = np.nan
+        out['w3_rank_preservation_rate'] = np.nan
         if dz_ci:
             out['w3_cohens_d_ci_low'] = np.nan
             out['w3_cohens_d_ci_high'] = np.nan
+    
+    # 5) 라그 분포 변화: baseline과 perturbed의 cg_bestlag 비교
+    bestlag_b = baseline_metrics.get('cg_bestlag', np.nan)
+    bestlag_p = perturb_metrics.get('cg_bestlag', np.nan)
+    
+    if np.isfinite(bestlag_b) and np.isfinite(bestlag_p):
+        # 단일 스칼라 값인 경우: 절대 차이
+        out['w3_lag_distribution_change'] = float(abs(bestlag_p - bestlag_b))
+    else:
+        out['w3_lag_distribution_change'] = np.nan
     
     return out
