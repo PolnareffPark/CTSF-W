@@ -140,7 +140,6 @@ class W1Experiment(BaseExperiment):
                 hooks_data["layerwise_losses"] = layerwise_losses
             
             # 그래디언트 수집: 작은 배치로 역전파 수행
-            self.model.eval()  # eval 모드 유지하되 gradient 계산
             small_loader = torch.utils.data.DataLoader(
                 self.test_loader.dataset,
                 batch_size=min(16, self.cfg.get("batch_size", 128)),
@@ -148,37 +147,46 @@ class W1Experiment(BaseExperiment):
                 num_workers=0
             )
             
-            # 한 배치로 그래디언트 계산
-            for xb, yb in small_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
-                xb.requires_grad_(True)
-                
-                # Forward with gradient tracking
-                self.model.zero_grad()
-                pred = self.model(xb)
-                
-                # 손실 계산
-                loss = torch.nn.functional.mse_loss(pred, yb)
-                
-                # Backward
-                loss.backward()
-                
-                # 각 경로의 첫 파라미터 그래디언트 수집 (대표값)
-                if has_direct_blocks:
-                    # CNN 경로 그래디언트
-                    for name, param in self.model.named_parameters():
-                        if 'conv_blks' in name and param.grad is not None:
-                            cnn_grad_tensor = param.grad.detach().cpu().numpy().flatten()
-                            break
+            # 그래디언트 계산을 위해 일시적으로 train 모드 전환
+            original_mode = self.model.training
+            self.model.train()  # RNN backward를 위해 train 모드 필요
+            
+            try:
+                # 한 배치로 그래디언트 계산
+                for xb, yb in small_loader:
+                    xb, yb = xb.to(self.device), yb.to(self.device)
+                    xb.requires_grad_(True)
                     
-                    # GRU 경로 그래디언트
-                    for name, param in self.model.named_parameters():
-                        if 'gru_blks' in name and param.grad is not None:
-                            gru_grad_tensor = param.grad.detach().cpu().numpy().flatten()
-                            break
-                
-                # 첫 배치만 사용
-                break
+                    # Forward with gradient tracking
+                    self.model.zero_grad()
+                    pred = self.model(xb)
+                    
+                    # 손실 계산
+                    loss = torch.nn.functional.mse_loss(pred, yb)
+                    
+                    # Backward
+                    loss.backward()
+                    
+                    # 각 경로의 첫 파라미터 그래디언트 수집 (대표값)
+                    if has_direct_blocks:
+                        # CNN 경로 그래디언트
+                        for name, param in self.model.named_parameters():
+                            if 'conv_blks' in name and param.grad is not None:
+                                cnn_grad_tensor = param.grad.detach().cpu().numpy().flatten()
+                                break
+                        
+                        # GRU 경로 그래디언트
+                        for name, param in self.model.named_parameters():
+                            if 'gru_blks' in name and param.grad is not None:
+                                gru_grad_tensor = param.grad.detach().cpu().numpy().flatten()
+                                break
+                    
+                    # 첫 배치만 사용
+                    break
+            finally:
+                # 원래 모드로 복원
+                if not original_mode:
+                    self.model.eval()
             
             if cnn_grad_tensor is not None and gru_grad_tensor is not None:
                 # 두 그래디언트의 크기를 맞춤 (작은 쪽에 맞춤)

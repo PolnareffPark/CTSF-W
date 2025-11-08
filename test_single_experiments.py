@@ -168,7 +168,7 @@ def main():
             status = "✓" if success else "✗"
             
             # 완료 상태를 한 줄로 표시
-            print(f"\r진행: {completed_tests}/{total_tests} ({progress_pct:.1f}%) | 경과: {format_time(elapsed)} | 남은시간: {eta_str} | {exp_type}-{mode} {status}    ", end="", flush=True)
+            print(f"진행: {completed_tests}/{total_tests} ({progress_pct:.1f}%) | 경과: {format_time(elapsed)} | 남은시간: {eta_str} | {exp_type}-{mode} {status}", flush=True)
     
     # 최종 요약
     print("\n" + "=" * 80)

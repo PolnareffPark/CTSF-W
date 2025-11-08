@@ -248,7 +248,7 @@ def run_experiment_suite(
                 elapsed_str = "0m"
             
             progress_pct = (completed / total_jobs) * 100
-            print(f"\r진행: {completed}/{total_jobs} ({progress_pct:.1f}%) | 경과: {elapsed_str} | 남은시간: {eta_str} | {experiment_type} {ds} H{H} s{s} {md} ✓    ", end="", flush=True)
+            print(f"진행: {completed}/{total_jobs} ({progress_pct:.1f}%) | 경과: {elapsed_str} | 남은시간: {eta_str} | {experiment_type} {ds} H{H} s{s} {md} ✓", flush=True)
         
         except Exception as e:
             # 오류 로깅
@@ -267,7 +267,7 @@ def run_experiment_suite(
             # 실패 상태 표시
             elapsed = time.time() - suite_start_time
             elapsed_str = f"{elapsed/3600:.1f}h" if elapsed > 3600 else f"{elapsed/60:.1f}m"
-            print(f"\r진행: {completed}/{total_jobs} | 경과: {elapsed_str} | {experiment_type} {ds} H{H} s{s} {md} ✗ ({str(e)[:50]})    ", end="", flush=True)
+            print(f"진행: {completed}/{total_jobs} | 경과: {elapsed_str} | {experiment_type} {ds} H{H} s{s} {md} ✗ ({str(e)[:50]})", flush=True)
             continue
 
 
