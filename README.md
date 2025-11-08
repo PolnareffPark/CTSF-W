@@ -322,7 +322,6 @@ pyyaml (설정 파일용)
 
 #### W1
 - `w1_cka_similarity_cnn_gru`: CKA 유사도
-- `w1_cca_similarity_cnn_gru`: CCA 유사도
 - `w1_layerwise_upward_improvement`: 층별 상향 개선도
 - `w1_inter_path_gradient_align`: 경로 간 그래디언트 정렬
 - 보고용: `cka_s/m/d`, `grad_align_s/m/d`

@@ -100,7 +100,6 @@ def test_w1_metrics_structure():
         
         expected_keys = [
             "w1_cka_similarity_cnn_gru",
-            "w1_cca_similarity_cnn_gru",
             "w1_layerwise_upward_improvement",
             "w1_inter_path_gradient_align"
         ]
@@ -112,7 +111,7 @@ def test_w1_metrics_structure():
         print(f"  ✓ 빈 hooks_data에서 모든 지표가 NaN 반환")
         
         # 가상의 데이터로 테스트
-        print("\n서브테스트 2-2: CKA/CCA 유사도 계산")
+        print("\n서브테스트 2-2: CKA 유사도 계산")
         n_samples = 100
         d_cnn = 256
         d_gru = 256
@@ -129,15 +128,10 @@ def test_w1_metrics_structure():
         
         assert not np.isnan(metrics["w1_cka_similarity_cnn_gru"]), \
             "CKA 유사도가 계산되지 않음"
-        assert not np.isnan(metrics["w1_cca_similarity_cnn_gru"]), \
-            "CCA 유사도가 계산되지 않음"
         assert 0 <= metrics["w1_cka_similarity_cnn_gru"] <= 1, \
             f"CKA 유사도가 범위를 벗어남: {metrics['w1_cka_similarity_cnn_gru']}"
-        assert 0 <= metrics["w1_cca_similarity_cnn_gru"] <= 1, \
-            f"CCA 유사도가 범위를 벗어남: {metrics['w1_cca_similarity_cnn_gru']}"
         
         print(f"  ✓ CKA 유사도: {metrics['w1_cka_similarity_cnn_gru']:.4f}")
-        print(f"  ✓ CCA 유사도: {metrics['w1_cca_similarity_cnn_gru']:.4f}")
         
         # 층별 개선도 테스트
         print("\n서브테스트 2-3: 층별 상향 개선도 계산")
@@ -291,7 +285,7 @@ def test_metrics_integration():
         # W1 지표 계산
         metrics = compute_w1_metrics(model, hooks_data)
         
-        print(f"\n  계산된 W1 지표:")
+        print("  계산된 W1 지표:")
         for key, value in metrics.items():
             if np.isnan(value):
                 print(f"    {key}: NaN")
@@ -301,7 +295,6 @@ def test_metrics_integration():
         # 모든 지표가 계산되었는지 확인
         expected_keys = [
             "w1_cka_similarity_cnn_gru",
-            "w1_cca_similarity_cnn_gru",
             "w1_layerwise_upward_improvement",
             "w1_inter_path_gradient_align"
         ]
@@ -313,8 +306,6 @@ def test_metrics_integration():
         # 값 범위 검증
         assert 0 <= metrics["w1_cka_similarity_cnn_gru"] <= 1, \
             f"CKA 유사도가 범위 [0, 1]을 벗어남"
-        assert 0 <= metrics["w1_cca_similarity_cnn_gru"] <= 1, \
-            f"CCA 유사도가 범위 [0, 1]을 벗어남"
         assert metrics["w1_layerwise_upward_improvement"] > 0, \
             f"손실 감소 시나리오에서 개선도가 양수여야 함"
         assert -1 <= metrics["w1_inter_path_gradient_align"] <= 1, \

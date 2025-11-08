@@ -41,7 +41,7 @@ def save_results_unified(row: dict, out_root: str = "results", experiment_type: 
     # 실험별 특화 지표 컬럼
     exp_specific_cols = {
         "W1": [
-            "w1_cka_similarity_cnn_gru", "w1_cca_similarity_cnn_gru",
+            "w1_cka_similarity_cnn_gru",
             "w1_layerwise_upward_improvement", "w1_inter_path_gradient_align",
             # 보고용 그림 지표
             "cka_s", "cka_m", "cka_d",  # 층별 CKA
