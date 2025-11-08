@@ -324,11 +324,16 @@ def update_w1_forest_summary_from_results(
         return
     df = pd.read_csv(results_w1_csv)
 
+    if "rmse_real" not in df.columns:
+        if "rmse" in df.columns:
+            df["rmse_real"] = df["rmse"]
+        else:
+            return
+
     # 필수 하위셋
     req_cols = ["dataset","horizon","seed","mode","rmse_real"]
     for c in req_cols:
         if c not in df.columns:
-            # 최소한 rmse_real은 필요
             return
 
     # per/last 분리 후 조인
@@ -363,17 +368,24 @@ def update_w1_forest_summary_from_results(
         base["delta_grad_align_all"] = np.nan
 
     # Top-pick 점수 (무가중치 z-합; 그룹=dataset×horizon)
-    def _compute_top_score(grp: pd.DataFrame) -> pd.DataFrame:
+    grouped_frames = []
+    for (_, grp) in base.groupby(["dataset", "horizon"], group_keys=False):
+        grp = grp.copy()
         z_rmse = _zscore(grp["delta_rmse_pct"])
-        z_cka  = _zscore(grp["delta_cka_global"]) if "delta_cka_global" in grp else pd.Series(0, index=grp.index)
-        z_gal  = _zscore(grp["delta_grad_align_all"]) if "delta_grad_align_all" in grp else pd.Series(0, index=grp.index)
+        z_cka = _zscore(grp["delta_cka_global"]) if "delta_cka_global" in grp else pd.Series(0, index=grp.index)
+        z_gal = _zscore(grp["delta_grad_align_all"]) if "delta_grad_align_all" in grp else pd.Series(0, index=grp.index)
         score = z_rmse
-        if z_cka is not None: score = score + z_cka
-        if z_gal is not None: score = score + z_gal
+        if z_cka is not None:
+            score = score + z_cka
+        if z_gal is not None:
+            score = score + z_gal
         grp["top_pick_score_w1"] = score
-        return grp
+        grouped_frames.append(grp)
 
-    base = base.groupby(["dataset","horizon"], group_keys=False).apply(_compute_top_score)
+    if grouped_frames:
+        base = pd.concat(grouped_frames, ignore_index=True)
+    else:
+        base = base.assign(top_pick_score_w1=np.nan)
 
     # forest summary 스키마 정리
     forest_cols = [

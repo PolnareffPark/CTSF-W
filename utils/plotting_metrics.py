@@ -9,91 +9,157 @@ from typing import Dict, Optional, List
 from utils.metrics import _dcor_u, _safe_corr
 try:
     from utils.experiment_metrics.w1_metrics import _cka_similarity
-    # _cca_similarity는 현재 사용하지 않지만 향후 사용 가능
-    from utils.experiment_metrics.w1_metrics import _cca_similarity  # noqa: F401
 except ImportError:
-    # Fallback
     def _cka_similarity(X, Y):
         return np.nan
 
+
+def _split_bins_auto(n_layers: int) -> List[str]:
+    if n_layers <= 0:
+        return []
+    first_cut = int(np.floor(n_layers / 3))
+    second_cut = int(np.floor(2 * n_layers / 3))
+    bins = []
+    for idx in range(n_layers):
+        if idx < first_cut:
+            bins.append("S")
+        elif idx < second_cut:
+            bins.append("M")
+        else:
+            bins.append("D")
+    return bins
 
 def compute_layerwise_cka(
     model,
     loader,
     device=None,
-    n_samples=256,
+    n_samples: int = 256,
     layers_to_sample=None
 ) -> Dict[str, float]:
     """
-    층별 CKA 유사도 계산 (W1, W4용)
-    
-    Returns:
-        dict with keys: cka_s, cka_m, cka_d (얕/중/깊)
+    층별 CKA 유사도 계산. S/M/D 요약뿐 아니라 전체 CNN×GRU CKA 행렬을 반환한다.
     """
     if device is None:
         device = next(model.parameters()).device
-    
+
+    original_mode = model.training
     model.eval()
+
     depth = len(model.conv_blks)
-    
+    if depth == 0:
+        return {}
+
     if layers_to_sample is None:
-        # 얕/중/깊 층 선택
-        shallow_idx = max(0, depth // 3 - 1)
-        mid_idx = depth // 2
-        deep_idx = depth - 1
-        layers_to_sample = [shallow_idx, mid_idx, deep_idx]
-    
-    # 층별 CNN/GRU 출력 수집
+        layers_to_sample = list(range(depth))
+
     cnn_outputs = {i: [] for i in layers_to_sample}
     gru_outputs = {i: [] for i in layers_to_sample}
-    
-    sample_count = 0
-    
+
+    collected = 0
+
     with torch.no_grad():
         for xb, yb in loader:
-            if sample_count >= n_samples:
+            if collected >= n_samples:
                 break
-            
+
             xb = xb.to(device)
             B = xb.size(0)
-            
-            # Forward pass with layer hooks
+
             z0 = model.patch(model.revin(xb, mode='norm')).permute(2, 0, 1)
             zc = zr = z0
-            
-            for i, (cb, gb) in enumerate(zip(model.conv_blks, model.gru_blks)):
+
+            for idx, (cb, gb) in enumerate(zip(model.conv_blks, model.gru_blks)):
                 zc = cb(zc)
                 zr = gb(zr)
-                
-                if i in layers_to_sample:
-                    # (T, B, d) -> (B, T*d)로 flatten
+
+                if idx in layers_to_sample:
                     cnn_flat = zc.permute(1, 0, 2).reshape(B, -1).cpu().numpy()
                     gru_flat = zr.permute(1, 0, 2).reshape(B, -1).cpu().numpy()
-                    
-                    cnn_outputs[i].append(cnn_flat)
-                    gru_outputs[i].append(gru_flat)
-                
-                if i < len(model.xhconv_blks):
-                    zc, zr = model.xhconv_blks[i](zc, zr)
-            
-            sample_count += B
-    
-    # CKA 계산
-    results = {}
-    for i, layer_name in zip(layers_to_sample, ['s', 'm', 'd']):
-        if len(cnn_outputs[i]) > 0 and len(gru_outputs[i]) > 0:
-            cnn_all = np.concatenate(cnn_outputs[i], axis=0)[:n_samples]
-            gru_all = np.concatenate(gru_outputs[i], axis=0)[:n_samples]
-            
-            if cnn_all.shape[0] == gru_all.shape[0] and cnn_all.shape[0] > 1:
-                cka_val = _cka_similarity(cnn_all, gru_all)
-                results[f"cka_{layer_name}"] = cka_val
-            else:
-                results[f"cka_{layer_name}"] = np.nan
+                    cnn_outputs[idx].append(cnn_flat)
+                    gru_outputs[idx].append(gru_flat)
+
+                if idx < len(model.xhconv_blks):
+                    zc, zr = model.xhconv_blks[idx](zc, zr)
+
+            collected += B
+
+    if not original_mode:
+        model.eval()
+    else:
+        model.train()
+
+    # 변환 및 최소 샘플 확보
+    cnn_arrays = []
+    gru_arrays = []
+    for idx in range(depth):
+        if idx in cnn_outputs and cnn_outputs[idx]:
+            arr = np.concatenate(cnn_outputs[idx], axis=0)
+            cnn_arrays.append(arr)
         else:
-            results[f"cka_{layer_name}"] = np.nan
-    
-    return results
+            cnn_arrays.append(None)
+
+        if idx in gru_outputs and gru_outputs[idx]:
+            arr = np.concatenate(gru_outputs[idx], axis=0)
+            gru_arrays.append(arr)
+        else:
+            gru_arrays.append(None)
+
+    valid_counts = [arr.shape[0] for arr in cnn_arrays if arr is not None]
+    valid_counts += [arr.shape[0] for arr in gru_arrays if arr is not None]
+    min_samples = min(valid_counts) if valid_counts else 0
+    if min_samples <= 1:
+        return {
+            "cka_matrix": np.full((depth, depth), np.nan),
+            "cnn_depth_bins": _split_bins_auto(depth),
+            "gru_depth_bins": _split_bins_auto(depth),
+            "cka_s": np.nan,
+            "cka_m": np.nan,
+            "cka_d": np.nan,
+            "cka_diag_mean": np.nan,
+            "cka_full_mean": np.nan,
+        }
+
+    min_samples = min(min_samples, n_samples)
+
+    cka_matrix = np.full((depth, depth), np.nan)
+    for i in range(depth):
+        if cnn_arrays[i] is None:
+            continue
+        cnn_data = cnn_arrays[i][:min_samples]
+        if cnn_data.shape[0] <= 1:
+            continue
+        for j in range(depth):
+            if gru_arrays[j] is None:
+                continue
+            gru_data = gru_arrays[j][:min_samples]
+            if gru_data.shape[0] <= 1:
+                continue
+            cka_matrix[i, j] = _cka_similarity(cnn_data, gru_data)
+
+    cnn_bins = _split_bins_auto(depth)
+    gru_bins = _split_bins_auto(depth)
+
+    def _band_mean(band: str) -> float:
+        idx_c = [i for i, b in enumerate(cnn_bins) if b == band]
+        idx_g = [j for j, b in enumerate(gru_bins) if b == band]
+        if not idx_c or not idx_g:
+            return np.nan
+        sub = cka_matrix[np.ix_(idx_c, idx_g)]
+        return float(np.nanmean(sub)) if np.isfinite(sub).any() else np.nan
+
+    diag_mean = float(np.nanmean(np.diag(cka_matrix))) if np.isfinite(np.diag(cka_matrix)).any() else np.nan
+    full_mean = float(np.nanmean(cka_matrix)) if np.isfinite(cka_matrix).any() else np.nan
+
+    return {
+        "cka_matrix": cka_matrix,
+        "cnn_depth_bins": cnn_bins,
+        "gru_depth_bins": gru_bins,
+        "cka_s": _band_mean("S"),
+        "cka_m": _band_mean("M"),
+        "cka_d": _band_mean("D"),
+        "cka_diag_mean": diag_mean,
+        "cka_full_mean": full_mean,
+    }
 
 
 def compute_gradient_alignment(
@@ -113,19 +179,22 @@ def compute_gradient_alignment(
     """
     if device is None:
         device = next(model.parameters()).device
-    
+
+    original_mode = model.training
     model.train()  # gradient 계산을 위해 train mode
     depth = len(model.conv_blks)
-    
+
+    if depth == 0:
+        return {}
+
     if layers_to_sample is None:
-        shallow_idx = max(0, depth // 3 - 1)
-        mid_idx = depth // 2
-        deep_idx = depth - 1
-        layers_to_sample = [shallow_idx, mid_idx, deep_idx]
-    
-    # Gradient hooks
+        layers_to_sample = list(range(depth))
+
+    depth_bins = _split_bins_auto(depth)
+
     cnn_grads = {i: [] for i in layers_to_sample}
     gru_grads = {i: [] for i in layers_to_sample}
+    alignment_logs = {i: [] for i in layers_to_sample}
     
     def make_grad_hook(layer_idx, store_dict, path_name):
         def hook(module, grad_input, grad_output):
@@ -138,12 +207,8 @@ def compute_gradient_alignment(
     
     handles = []
     for i in layers_to_sample:
-        h1 = model.conv_blks[i].register_full_backward_hook(
-            make_grad_hook(i, cnn_grads, 'cnn')
-        )
-        h2 = model.gru_blks[i].register_full_backward_hook(
-            make_grad_hook(i, gru_grads, 'gru')
-        )
+        h1 = model.conv_blks[i].register_full_backward_hook(make_grad_hook(i, cnn_grads, 'cnn'))
+        h2 = model.gru_blks[i].register_full_backward_hook(make_grad_hook(i, gru_grads, 'gru'))
         handles.extend([h1, h2])
     
     batch_count = 0
@@ -162,33 +227,72 @@ def compute_gradient_alignment(
             
             batch_count += 1
     finally:
-        # Cleanup
         for h in handles:
             h.remove()
-        model.eval()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    # Gradient alignment 계산 (코사인 유사도)
-    results = {}
-    for i, layer_name in zip(layers_to_sample, ['s', 'm', 'd']):
-        if len(cnn_grads[i]) > 0 and len(gru_grads[i]) > 0:
-            cnn_g = np.concatenate(cnn_grads[i], axis=0)
-            gru_g = np.concatenate(gru_grads[i], axis=0)
-            
-            if cnn_g.shape[0] == gru_g.shape[0] and cnn_g.shape[0] > 0:
-                # 배치별 코사인 유사도 평균
-                alignments = []
-                for j in range(cnn_g.shape[0]):
-                    align = _safe_corr(cnn_g[j], gru_g[j])
-                    if np.isfinite(align):
-                        alignments.append(align)
-                
-                results[f"grad_align_{layer_name}"] = float(np.mean(alignments)) if alignments else np.nan
-            else:
-                results[f"grad_align_{layer_name}"] = np.nan
+        if original_mode:
+            model.train()
         else:
-            results[f"grad_align_{layer_name}"] = np.nan
-    
+            model.eval()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Gradient alignment 계산 (코사인 유사도)
+    grad_align_by_layer = []
+    s_vals, m_vals, d_vals = [], [], []
+
+    for i in layers_to_sample:
+        if len(cnn_grads[i]) == 0 or len(gru_grads[i]) == 0:
+            grad_align_by_layer.append({
+                "layer_idx": i,
+                "depth_bin": depth_bins[i] if i < len(depth_bins) else "",
+                "grad_align_value": np.nan,
+            })
+            continue
+
+        cnn_g = np.concatenate(cnn_grads[i], axis=0)
+        gru_g = np.concatenate(gru_grads[i], axis=0)
+
+        if cnn_g.shape[0] != gru_g.shape[0] or cnn_g.shape[0] == 0:
+            grad_align_by_layer.append({
+                "layer_idx": i,
+                "depth_bin": depth_bins[i] if i < len(depth_bins) else "",
+                "grad_align_value": np.nan,
+            })
+            continue
+
+        alignments = []
+        for j in range(cnn_g.shape[0]):
+            align = _safe_corr(cnn_g[j], gru_g[j])
+            if np.isfinite(align):
+                alignments.append(align)
+
+        mean_align = float(np.mean(alignments)) if alignments else np.nan
+        grad_align_by_layer.append({
+            "layer_idx": i,
+            "depth_bin": depth_bins[i] if i < len(depth_bins) else "",
+            "grad_align_value": mean_align,
+        })
+
+        bin_label = depth_bins[i] if i < len(depth_bins) else ""
+        if bin_label == "S":
+            s_vals.append(mean_align)
+        elif bin_label == "M":
+            m_vals.append(mean_align)
+        elif bin_label == "D":
+            d_vals.append(mean_align)
+
+    def _mean_or_nan(values):
+        vals = [v for v in values if np.isfinite(v)]
+        return float(np.mean(vals)) if vals else np.nan
+
+    results = {
+        "grad_align_by_layer": grad_align_by_layer,
+        "grad_align_s": _mean_or_nan(s_vals),
+        "grad_align_m": _mean_or_nan(m_vals),
+        "grad_align_d": _mean_or_nan(d_vals),
+    }
+    all_vals = [entry["grad_align_value"] for entry in grad_align_by_layer if np.isfinite(entry["grad_align_value"])]
+    results["grad_align_mean"] = float(np.mean(all_vals)) if all_vals else np.nan
+
     return results
 
 
@@ -426,19 +530,16 @@ def compute_all_plotting_metrics(
     """
     results = {}
     
-    # 공통: 게이트 분포
+    if experiment_type == "W1":
+        # W1은 전용 모듈을 통해 그림 데이터를 처리하므로 여기서는 반환하지 않음
+        return results
+
     gate_dist = compute_gate_distribution(model, device)
     results.update(gate_dist)
-    
-    if experiment_type in ["W1", "W4"]:
-        # 층별 CKA
+
+    if experiment_type == "W4":
         cka_results = compute_layerwise_cka(model, loader, device)
-        results.update(cka_results)
-        
-        # 층별 그래디언트 정렬 (W1만, 선택적)
-        if experiment_type == "W1" and kwargs.get("compute_grad_align", False):
-            grad_results = compute_gradient_alignment(model, loader, mu, std, device)
-            results.update(grad_results)
+        results.update({k: v for k, v in cka_results.items() if k in ["cka_s", "cka_m", "cka_d", "cka_diag_mean", "cka_full_mean"]})
     
     if experiment_type == "W2":
         # 시간대별 게이트 히트맵
@@ -452,5 +553,5 @@ def compute_all_plotting_metrics(
         baseline_hooks_data = kwargs.get("baseline_hooks_data")
         lag_results = compute_bestlag_distribution(hooks_data, baseline_hooks_data)
         results.update(lag_results)
-    
+ 
     return results

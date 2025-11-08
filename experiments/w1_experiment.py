@@ -2,6 +2,7 @@
 W1 실험: 층별 교차 vs. 최종 결합 (Late Fusion)
 """
 
+from pathlib import Path
 import torch
 import numpy as np
 from experiments.base_experiment import BaseExperiment
@@ -9,6 +10,12 @@ from models.ctsf_model import HybridTS
 from models.experiment_variants import LastLayerFusionModel
 from utils.direct_evidence import evaluate_with_direct_evidence
 from data.dataset import build_test_tod_vector
+from utils.plotting_metrics import compute_layerwise_cka, compute_gradient_alignment
+from utils.experiment_plotting_metrics.w1_plotting_metrics import (
+    save_w1_cka_heatmap,
+    save_w1_grad_align_bar,
+    update_w1_forest_summary_from_results,
+)
 
 
 class W1Experiment(BaseExperiment):
@@ -39,6 +46,7 @@ class W1Experiment(BaseExperiment):
         
         # W1 특화: CNN/GRU 표현, 층별 손실, 그래디언트 수집
         hooks_data = {}
+        self._w1_plot_metrics = {}
         hooks = []
         
         # 마지막 층의 CNN/GRU 표현 수집
@@ -110,6 +118,13 @@ class W1Experiment(BaseExperiment):
         # 그래디언트 수집을 위한 텐서 (forward 시 저장)
         cnn_grad_tensor = None
         gru_grad_tensor = None
+
+        small_loader = torch.utils.data.DataLoader(
+            self.test_loader.dataset,
+            batch_size=min(16, self.cfg.get("batch_size", 128)),
+            shuffle=False,
+            num_workers=0
+        )
         
         try:
             # 기본 평가 수행 (표현 수집)
@@ -140,12 +155,6 @@ class W1Experiment(BaseExperiment):
                 hooks_data["layerwise_losses"] = layerwise_losses
             
             # 그래디언트 수집: 작은 배치로 역전파 수행
-            small_loader = torch.utils.data.DataLoader(
-                self.test_loader.dataset,
-                batch_size=min(16, self.cfg.get("batch_size", 128)),
-                shuffle=False,
-                num_workers=0
-            )
             
             # 그래디언트 계산을 위해 일시적으로 train 모드 전환
             original_mode = self.model.training
@@ -219,30 +228,76 @@ class W1Experiment(BaseExperiment):
         except ImportError:
             pass
         
-        # 보고용 그림 지표 계산
-        from utils.plotting_metrics import compute_all_plotting_metrics
-        
-        small_loader = torch.utils.data.DataLoader(
-            self.test_loader.dataset,
-            batch_size=min(16, self.cfg.get("batch_size", 128)),
-            shuffle=False,
-            num_workers=0
-        )
-        
-        plotting_metrics = compute_all_plotting_metrics(
+        # W1 전용 그림 지표 계산 및 저장 준비
+        cka_metrics = compute_layerwise_cka(
             model=self.model,
             loader=small_loader,
-            mu=self.mu,
-            std=self.std,
-            tod_vec=tod_vec,
             device=self.device,
-            experiment_type=self.experiment_type,
-            hooks_data=hooks_data,
-            compute_grad_align=self.cfg.get("compute_grad_align", False)
+            n_samples=256,
         )
-        
-        # 지표 통합
-        for k, v in plotting_metrics.items():
-            direct[k] = v
-        
+
+        if cka_metrics:
+            self._w1_plot_metrics["cka"] = cka_metrics
+            for key in ["cka_s", "cka_m", "cka_d", "cka_diag_mean", "cka_full_mean"]:
+                if key in cka_metrics:
+                    val = cka_metrics[key]
+                    direct[key] = float(val) if isinstance(val, (np.floating, float)) else val
+        else:
+            self._w1_plot_metrics["cka"] = {}
+
+        if self.cfg.get("compute_grad_align", False):
+            grad_metrics = compute_gradient_alignment(
+                model=self.model,
+                loader=small_loader,
+                mu=self.mu,
+                std=self.std,
+                device=self.device,
+            )
+            self._w1_plot_metrics["grad"] = grad_metrics
+            for key in ["grad_align_s", "grad_align_m", "grad_align_d", "grad_align_mean"]:
+                if key in grad_metrics:
+                    val = grad_metrics[key]
+                    direct[key] = float(val) if isinstance(val, (np.floating, float)) else val
+        else:
+            self._w1_plot_metrics["grad"] = {}
+
         return direct
+
+    def save_results(self, direct_metrics):
+        fpath = super().save_results(direct_metrics)
+        plot_root = Path(self.out_root) / f"results_{self.experiment_type}" / self.dataset_tag
+        ctx_base = {
+            "experiment_type": self.experiment_type,
+            "dataset": self.dataset_tag,
+            "horizon": int(self.cfg["horizon"]),
+            "seed": int(self.cfg["seed"]),
+            "mode": self.cfg.get("mode", "default"),
+        }
+
+        cka_metrics = self._w1_plot_metrics.get("cka", {})
+        if cka_metrics and cka_metrics.get("cka_matrix") is not None:
+            ctx = {**ctx_base, "plot_type": "cka_heatmap"}
+            save_w1_cka_heatmap(ctx, cka_metrics, out_dir=plot_root / "cka_heatmap")
+
+        grad_metrics = self._w1_plot_metrics.get("grad", {})
+
+        def _has_finite_grad(values):
+            for key in values:
+                val = grad_metrics.get(key)
+                if isinstance(val, (float, np.floating)) and np.isfinite(val):
+                    return True
+            return False
+
+        if grad_metrics and (
+            grad_metrics.get("grad_align_by_layer")
+            or _has_finite_grad(["grad_align_s", "grad_align_m", "grad_align_d"])
+        ):
+            ctx = {**ctx_base, "plot_type": "grad_align_bar"}
+            save_w1_grad_align_bar(ctx, grad_metrics, out_dir=plot_root / "grad_align_bar")
+
+        update_w1_forest_summary_from_results(
+            results_w1_csv=Path(fpath),
+            out_csv=plot_root / "forest_plot" / "forest_plot_summary.csv",
+        )
+
+        return fpath

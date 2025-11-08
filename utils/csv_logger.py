@@ -44,8 +44,8 @@ def save_results_unified(row: dict, out_root: str = "results", experiment_type: 
             "w1_cka_similarity_cnn_gru",
             "w1_layerwise_upward_improvement", "w1_inter_path_gradient_align",
             # 보고용 그림 지표
-            "cka_s", "cka_m", "cka_d",  # 층별 CKA
-            "grad_align_s", "grad_align_m", "grad_align_d",  # 층별 그래디언트 정렬
+            "cka_s", "cka_m", "cka_d", "cka_diag_mean", "cka_full_mean",  # 층별/전체 CKA
+            "grad_align_s", "grad_align_m", "grad_align_d", "grad_align_mean",  # 층별 그래디언트 정렬
         ],
         "W2": [
             "w2_gate_variability_time", "w2_gate_variability_sample", "w2_gate_entropy",

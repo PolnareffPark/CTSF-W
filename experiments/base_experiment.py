@@ -304,7 +304,6 @@ class BaseExperiment:
         
         # 그림 타입별로 데이터 저장
         plot_types = {
-            "W1": ["forest_plot", "cka_heatmap", "grad_align_bar"],
             "W2": ["forest_plot", "gate_tod_heatmap", "gate_distribution"],
             "W3": ["effect_size_bar", "rank_preservation", "lag_distribution"],
             "W4": ["rmse_line", "gate_usage_bar", "cka_heatmap"],
