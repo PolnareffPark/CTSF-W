@@ -90,12 +90,15 @@ def compute_w2_metrics(
             # 동적 게이트: (N, n_layers, 4)
             N, n_layers, n_gates = gate_values_for_metrics.shape
             
-            # 1. 시간별 게이트 변동성: 각 시계열 내에서 게이트 값의 변화
-            # 여기서는 샘플을 시간축으로 간주하여, 각 층의 게이트가 샘플마다 얼마나 변하는지 측정
-            gate_std_per_layer = np.nanstd(gate_values_for_metrics, axis=0)  # (n_layers, 4)
-            metrics["w2_gate_variability_time"] = float(np.nanmean(gate_std_per_layer))
+            # 1. 시간별 게이트 변동성: 각 샘플 내에서 층별로 게이트가 얼마나 변하는지
+            # 각 샘플(N개)에 대해 (n_layers, 4) 값들의 표준편차를 구하고 평균
+            # shape: (N, n_layers*4) -> std along axis=1 -> (N,) -> mean
+            gate_reshaped = gate_values_for_metrics.reshape(N, -1)  # (N, n_layers*4)
+            gate_std_per_sample = np.nanstd(gate_reshaped, axis=1)  # (N,)
+            metrics["w2_gate_variability_time"] = float(np.nanmean(gate_std_per_sample))
             
             # 2. 샘플별 게이트 변동성: 동일 층/게이트에서 샘플 간 분산
+            # 각 (layer, gate) 조합에 대해 샘플 간(N개) 표준편차를 구하고 평균
             gate_std_per_gate = np.nanstd(gate_values_for_metrics, axis=0)  # (n_layers, 4)
             metrics["w2_gate_variability_sample"] = float(np.nanmean(gate_std_per_gate))
             
