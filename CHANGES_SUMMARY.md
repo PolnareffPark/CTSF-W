@@ -1,5 +1,31 @@
 ## 📝 최근 변경 내역
 
+### 2025-11-08: W5 실험 코드 개선 (평가 피드백 반영 - 3차)
+
+#### 1. GateFixedModel 원본 모델 보호 개선
+- **파일**: `experiments/w5_experiment.py`
+- **문제**: 기존 GateFixedModel이 원본 모델의 alpha 파라미터를 직접 수정하여 영구적으로 변형
+- **해결**: Context Manager 패턴으로 재구성
+- **상세**:
+  - `__enter__`: 훅 등록, 원본 alpha 값 백업
+  - `__exit__`: 훅 제거, 원본 alpha 복원
+  - `with GateFixedModel(model) as fixed_model:` 형태로 사용
+- **효과**:
+  - 원본 모델이 절대 변형되지 않음
+  - 안전한 리소스 관리 (훅 자동 해제)
+  - 코드 가독성 향상
+
+#### 2. 테스트 코드 업데이트
+- **파일**: `docs/experiment_modifications/test_w5_modifications.py`
+- **변경**: GateFixedModel의 context manager 사용 및 원본 복원 검증 추가
+- **테스트 항목**:
+  - 원본 alpha 백업 확인
+  - Context manager 진입/종료 시 훅 등록/제거 확인
+  - 원본 alpha 복원 확인
+  - 원본 모델 정상 작동 확인
+
+---
+
 ### 2025-11-07: W5 실험 코드 개선 (평가 피드백 반영 - 2차)
 
 #### 1. 게이트 출력 수집 활성화

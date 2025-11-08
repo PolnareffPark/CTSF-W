@@ -9,12 +9,27 @@ import numpy as np
 
 
 class GateFixedModel:
-    """게이트를 평균값으로 고정하는 래퍼"""
+    """
+    게이트를 평균값으로 고정하는 래퍼 (Context Manager)
+    
+    사용 방법:
+        with GateFixedModel(model) as fixed_model:
+            # 고정 게이트로 평가
+            results = evaluate(fixed_model, ...)
+        # with 블록을 벗어나면 자동으로 원본 모델 복원
+    
+    특징:
+    - 원본 모델의 alpha 값을 백업하고 사용 후 복원
+    - forward 훅을 등록하고 사용 후 자동 제거
+    - context manager 패턴으로 안전하게 관리
+    """
     def __init__(self, model):
         self.model = model
         self.gate_means = {}
+        self.original_alphas = {}  # 원본 alpha 값 백업
+        self.hooks = []
+        self._active = False
         self._compute_gate_means()
-        self._register_hooks()
     
     def _compute_gate_means(self):
         """
@@ -29,19 +44,50 @@ class GateFixedModel:
             # alpha는 학습된 파라미터 (Cross-Stitch 가중치)
             # ReLU를 적용하여 음수 방지
             self.gate_means[i] = torch.relu(blk.alpha).detach().clone()
+            # 원본 alpha 값 백업
+            self.original_alphas[i] = blk.alpha.data.clone()
     
     def _register_hooks(self):
-        """게이트 출력을 가로채서 평균으로 교체하는 훅"""
+        """게이트를 평균으로 고정하는 훅 등록"""
+        if self._active:
+            return  # 이미 활성화된 경우 중복 등록 방지
+        
         self.hooks = []
         for i, blk in enumerate(self.model.xhconv_blks):
             def make_hook(idx, mean_val):
                 def hook(module, input, output):
-                    # output은 (C, R) 튜플
                     # alpha를 평균으로 고정
+                    # 주의: 이는 일시적이며 __exit__에서 복원됨
                     module.alpha.data = mean_val.clone()
                 return hook
             hook = blk.register_forward_hook(make_hook(i, self.gate_means[i]))
             self.hooks.append(hook)
+        
+        self._active = True
+    
+    def _remove_hooks(self):
+        """등록된 훅 제거"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+        self._active = False
+    
+    def _restore_alphas(self):
+        """원본 alpha 값 복원"""
+        for i, blk in enumerate(self.model.xhconv_blks):
+            if i in self.original_alphas:
+                blk.alpha.data = self.original_alphas[i].clone()
+    
+    def __enter__(self):
+        """Context manager 진입: 훅 등록"""
+        self._register_hooks()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager 종료: 훅 제거 및 원본 복원"""
+        self._remove_hooks()
+        self._restore_alphas()
+        return False
     
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
@@ -72,7 +118,7 @@ class GateFixedModel:
     def __getattr__(self, name):
         """내부 모델의 속성에 접근 (conv_blks, resconv_blks 등)"""
         # 무한 재귀 방지: 기본 속성들은 여기서 처리하지 않음
-        if name in ('model', 'gate_means', 'hooks'):
+        if name in ('model', 'gate_means', 'original_alphas', 'hooks', '_active'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         # 내부 모델의 속성 반환
         try:
@@ -109,13 +155,15 @@ class W5Experiment(BaseExperiment):
         
         # 2. 게이트 고정 모드 평가
         # 게이트 출력 수집을 활성화하여 고정 시 변동성이 0에 가까운지 확인
-        fixed_model = GateFixedModel(self.model)
-        fixed_model.eval()
-        fixed_results = evaluate_with_direct_evidence(
-            fixed_model, self.test_loader, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device,
-            collect_gate_outputs=True
-        )
+        # Context manager를 사용하여 원본 모델 보호
+        with GateFixedModel(self.model) as fixed_model:
+            fixed_model.eval()
+            fixed_results = evaluate_with_direct_evidence(
+                fixed_model, self.test_loader, self.mu, self.std,
+                tod_vec=tod_vec, device=self.device,
+                collect_gate_outputs=True
+            )
+        # with 블록을 벗어나면 원본 모델의 alpha가 자동으로 복원됨
         
         # 3. W5 특화 비교 지표 계산
         w5_metrics = compute_w5_metrics(

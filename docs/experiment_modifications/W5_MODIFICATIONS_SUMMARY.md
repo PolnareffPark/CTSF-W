@@ -167,6 +167,124 @@ def compute_w5_metrics(...) -> Dict:
 
 ---
 
+## ✅ 수정 내용 (3차 - 2025-11-08)
+
+### 7. GateFixedModel 원본 모델 보호 개선
+
+**문제 상황**:
+피드백에서 지적한 바와 같이, 기존 GateFixedModel이 forward 훅에서 `module.alpha.data = mean_val`로 원본 모델의 파라미터를 직접 덮어쓰는 문제가 있었습니다:
+- 훅이 등록되면 이후 모든 forward에서 계속 α를 고정
+- 고정 평가 후에도 훅이 제거되지 않아 원본 모델이 영구적으로 변형
+- 실험 종료 후 해당 모델을 다시 사용하면 동적 게이트로 동작하지 않음
+
+**해결 방안**:
+Context Manager 패턴으로 GateFixedModel을 재구성하여 안전한 리소스 관리 구현
+
+**수정된 코드**:
+
+```python
+class GateFixedModel:
+    """
+    게이트를 평균값으로 고정하는 래퍼 (Context Manager)
+    
+    사용 방법:
+        with GateFixedModel(model) as fixed_model:
+            # 고정 게이트로 평가
+            results = evaluate(fixed_model, ...)
+        # with 블록을 벗어나면 자동으로 원본 모델 복원
+    """
+    def __init__(self, model):
+        self.model = model
+        self.gate_means = {}
+        self.original_alphas = {}  # 원본 alpha 값 백업
+        self.hooks = []
+        self._active = False
+        self._compute_gate_means()
+    
+    def _compute_gate_means(self):
+        """게이트 평균값 계산 및 원본 백업"""
+        for i, blk in enumerate(self.model.xhconv_blks):
+            self.gate_means[i] = torch.relu(blk.alpha).detach().clone()
+            # 원본 alpha 값 백업!
+            self.original_alphas[i] = blk.alpha.data.clone()
+    
+    def __enter__(self):
+        """Context manager 진입: 훅 등록"""
+        self._register_hooks()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager 종료: 훅 제거 및 원본 복원"""
+        self._remove_hooks()
+        self._restore_alphas()  # 원본 복원!
+        return False
+    
+    def _remove_hooks(self):
+        """등록된 훅 제거"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+        self._active = False
+    
+    def _restore_alphas(self):
+        """원본 alpha 값 복원"""
+        for i, blk in enumerate(self.model.xhconv_blks):
+            if i in self.original_alphas:
+                blk.alpha.data = self.original_alphas[i].clone()
+```
+
+**사용 방법 변경**:
+
+```python
+# 이전 (문제 있음)
+fixed_model = GateFixedModel(self.model)
+fixed_model.eval()
+fixed_results = evaluate_with_direct_evidence(fixed_model, ...)
+# 원본 모델이 변형됨!
+
+# 수정 후 (안전)
+with GateFixedModel(self.model) as fixed_model:
+    fixed_model.eval()
+    fixed_results = evaluate_with_direct_evidence(fixed_model, ...)
+# with 블록을 벗어나면 원본 모델 자동 복원!
+```
+
+**변경 효과**:
+- ✅ 원본 모델의 alpha가 절대 변형되지 않음
+- ✅ 훅이 자동으로 제거됨 (메모리 누수 방지)
+- ✅ 예외 발생 시에도 안전하게 복원됨 (finally와 동일한 효과)
+- ✅ 코드 의도가 명확해짐 (context manager = 임시 상태)
+- ✅ Python의 best practice 준수
+
+### 8. 테스트 코드 강화
+
+테스트에 원본 모델 보호 검증 추가:
+
+```python
+def test_gate_fixed_model():
+    # 원본 alpha 저장
+    original_alphas = [blk.alpha.data.clone() for blk in model.xhconv_blks]
+    
+    with fixed_model_wrapper as fixed_model:
+        # 고정 모델 평가
+        out_fixed = fixed_model(x)
+        # 훅이 등록되어 있음
+        assert len(fixed_model.hooks) > 0
+    
+    # Context 종료 후 검증
+    assert len(fixed_model_wrapper.hooks) == 0  # 훅 제거 확인
+    
+    # 원본 alpha 복원 확인
+    for i, blk in enumerate(model.xhconv_blks):
+        assert torch.allclose(blk.alpha.data, original_alphas[i])
+    
+    # 원본 모델이 정상 작동하는지 확인
+    out_dynamic_after = model(x)
+    assert torch.allclose(out_dynamic_before, out_dynamic_after)
+```
+
+---
+
 ## ✅ 수정 내용 (2차 - 2025-11-08)
 
 ### 4. 게이트 출력 수집 활성화
@@ -443,13 +561,13 @@ cat results/results_W5.csv
 
 | 파일 | 변경 내용 | 중요도 | 수정 차수 |
 |------|-----------|--------|----------|
-| `experiments/w5_experiment.py` | evaluate_test() 완전 재구성, collect_gate_outputs 추가 | ★★★★★ | 1차, 2차 |
+| `experiments/w5_experiment.py` | GateFixedModel context manager 개선, 원본 보호 | ★★★★★ | 1차, 2차, 3차 |
 | `run_suite.py` | W5 modes를 ["dynamic"]만 사용하도록 수정 | ★★★★☆ | 2차 |
 | `utils/csv_logger.py` | W5 CSV 컬럼 확장 (고정 지표, 게이트 변동성) | ★★★★☆ | 2차 |
 | `utils/experiment_metrics/w5_metrics.py` | docstring 개선, 지표 해석 추가 | ★★★☆☆ | 1차 |
-| `docs/experiment_modifications/test_w5_modifications.py` | 테스트 스크립트 신규 작성 | ★★★★☆ | 1차 |
-| `docs/experiment_modifications/W5_MODIFICATIONS_SUMMARY.md` | 상세 문서 (1차, 2차 수정 내역) | ★★★☆☆ | 1차, 2차 |
-| `CHANGES_SUMMARY.md` | W5 수정 내역 (1차, 2차) | ★★☆☆☆ | 1차, 2차 |
+| `docs/experiment_modifications/test_w5_modifications.py` | 테스트 스크립트 및 원본 복원 검증 | ★★★★☆ | 1차, 3차 |
+| `docs/experiment_modifications/W5_MODIFICATIONS_SUMMARY.md` | 상세 문서 (1-3차 수정 내역) | ★★★☆☆ | 1차, 2차, 3차 |
+| `CHANGES_SUMMARY.md` | W5 수정 내역 (1-3차) | ★★☆☆☆ | 1차, 2차, 3차 |
 
 ---
 
@@ -462,21 +580,47 @@ cat results/results_W5.csv
     ↓
 평가 단계:
     ├─ 동적 게이트 평가 → dynamic_results
-    ├─ 고정 게이트 평가 → fixed_results
+    ├─ 고정 게이트 평가 (Context Manager) → fixed_results
+    │   └─ with GateFixedModel(model):
+    │       ├─ 훅 등록
+    │       ├─ 평가 수행
+    │       └─ 자동 복원 (훅 제거 + alpha 복원)
     ├─ W5 지표 계산 → w5_metrics
     └─ 결과 병합 → final_results
 ```
 
-### 2. 자동화 개선
+### 2. 안전성 향상 (3차 수정)
 
-- 더 이상 두 번의 실행 불필요
+**원본 모델 보호**:
+- Context Manager로 임시 상태 관리
+- 예외 발생 시에도 안전하게 복원
+- 훅 자동 제거로 메모리 누수 방지
+- Python best practice 준수
+
+**Before (문제)**:
+```python
+fixed_model = GateFixedModel(model)
+results = evaluate(fixed_model, ...)
+# 원본 모델이 변형됨!
+```
+
+**After (안전)**:
+```python
+with GateFixedModel(model) as fixed_model:
+    results = evaluate(fixed_model, ...)
+# 자동으로 원본 복원!
+```
+
+### 3. 자동화 개선
+
+- 더 이상 두 번의 실행 불필요 (2차 수정)
 - CSV에 모든 정보가 자동으로 기록
 - 분석 스크립트가 쉽게 데이터를 활용 가능
 
-### 3. 유지보수성 향상
+### 4. 유지보수성 향상
 
-- 코드 의도가 명확함
-- 테스트 코드로 회귀 방지
+- 코드 의도가 명확함 (context manager = 임시 상태)
+- 테스트 코드로 회귀 방지 (원본 복원 검증 포함)
 - 문서화로 이해도 향상
 
 ---
@@ -539,7 +683,7 @@ alignment = event_gain * gate_variability
 
 ---
 
-**작성일**: 2025-11-07  
+**작성일**: 2025-11-07 (1차), 2025-11-08 (2차, 3차)  
 **작성자**: AI Assistant  
-**버전**: 1.0
+**버전**: 1.3 (최종)
 

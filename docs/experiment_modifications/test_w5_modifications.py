@@ -35,14 +35,18 @@ def test_gate_fixed_model():
         print(f"\n  모델 생성 완료")
         print(f"  교차 블록 수: {len(model.xhconv_blks)}")
         
-        # 게이트 고정 래퍼 적용
-        fixed_model = GateFixedModel(model)
+        # 원본 alpha 값 저장 (복원 확인용)
+        original_alphas = [blk.alpha.data.clone() for blk in model.xhconv_blks]
         
-        print(f"\n  GateFixedModel 래퍼 적용 완료")
-        print(f"  고정된 게이트 수: {len(fixed_model.gate_means)}")
+        # 게이트 고정 래퍼 적용 (Context Manager)
+        fixed_model_wrapper = GateFixedModel(model)
+        
+        print(f"\n  GateFixedModel 래퍼 생성 완료")
+        print(f"  고정 게이트 평균값 계산 완료: {len(fixed_model_wrapper.gate_means)}개")
+        print(f"  원본 alpha 백업 완료: {len(fixed_model_wrapper.original_alphas)}개")
         
         # 게이트 평균값 확인
-        for i, mean_val in fixed_model.gate_means.items():
+        for i, mean_val in fixed_model_wrapper.gate_means.items():
             print(f"    Layer {i}: gate_mean shape = {mean_val.shape}, "
                   f"min = {mean_val.min().item():.4f}, "
                   f"max = {mean_val.max().item():.4f}")
@@ -52,15 +56,8 @@ def test_gate_fixed_model():
         
         print(f"\n  ✓ 모든 게이트가 양수로 고정됨")
         
-        # forward hook 등록 확인
-        print(f"\n  등록된 훅 수: {len(fixed_model.hooks)}")
-        assert len(fixed_model.hooks) == len(model.xhconv_blks), "훅 개수가 블록 개수와 다름"
-        
-        print(f"  ✓ 모든 블록에 훅이 등록됨")
-        
-        # 간단한 forward 테스트
+        # Context manager로 사용
         model.eval()
-        fixed_model.eval()
         
         # 더미 입력 생성
         batch_size = 4
@@ -70,28 +67,53 @@ def test_gate_fixed_model():
         x = torch.randn(batch_size, lookback, n_vars)
         
         with torch.no_grad():
-            # 동적 모델 출력
-            out_dynamic = model(x)
-            print(f"\n  동적 모델 출력 shape: {out_dynamic.shape}")
+            # 동적 모델 출력 (before context)
+            out_dynamic_before = model(x)
+            print(f"\n  동적 모델 출력 (before) shape: {out_dynamic_before.shape}")
             
-            # 고정 모델 출력
-            out_fixed = fixed_model(x)
-            print(f"  고정 모델 출력 shape: {out_fixed.shape}")
+            # Context manager 내에서 고정 모델 평가
+            with fixed_model_wrapper as fixed_model:
+                print(f"\n  Context manager 진입 - 훅 등록됨")
+                print(f"  등록된 훅 수: {len(fixed_model.hooks)}")
+                assert len(fixed_model.hooks) == len(model.xhconv_blks), "훅 개수가 블록 개수와 다름"
+                
+                fixed_model.eval()
+                out_fixed = fixed_model(x)
+                print(f"  고정 모델 출력 shape: {out_fixed.shape}")
+                
+                # 출력 shape이 동일해야 함
+                assert out_dynamic_before.shape == out_fixed.shape, "출력 shape이 다름"
+                print(f"  ✓ 출력 shape 일치")
+                
+                # 출력이 달라야 함 (게이트 고정의 효과)
+                diff = torch.abs(out_dynamic_before - out_fixed).mean().item()
+                print(f"  동적 vs 고정 출력 차이: {diff:.6f}")
+                
+                if diff > 1e-6:
+                    print(f"  ✓ 게이트 고정이 출력에 영향을 미침")
+                else:
+                    print(f"  ⚠ 경고: 출력 차이가 매우 작음 (게이트 고정 효과 미미)")
             
-            # 출력 shape이 동일해야 함
-            assert out_dynamic.shape == out_fixed.shape, "출력 shape이 다름"
-            print(f"  ✓ 출력 shape 일치")
+            # Context manager 종료 후 - 원본 복원 확인
+            print(f"\n  Context manager 종료 - 훅 제거 및 원본 복원")
             
-            # 출력이 달라야 함 (게이트 고정의 효과)
-            diff = torch.abs(out_dynamic - out_fixed).mean().item()
-            print(f"\n  동적 vs 고정 출력 차이: {diff:.6f}")
+            # 훅이 제거되었는지 확인
+            assert len(fixed_model_wrapper.hooks) == 0, "훅이 제거되지 않음"
+            print(f"  ✓ 훅이 제거됨")
             
-            if diff > 1e-6:
-                print(f"  ✓ 게이트 고정이 출력에 영향을 미침")
-            else:
-                print(f"  ⚠ 경고: 출력 차이가 매우 작음 (게이트 고정 효과 미미)")
+            # 원본 alpha가 복원되었는지 확인
+            for i, blk in enumerate(model.xhconv_blks):
+                alpha_restored = torch.allclose(blk.alpha.data, original_alphas[i])
+                assert alpha_restored, f"Layer {i}의 alpha가 복원되지 않음"
+            print(f"  ✓ 원본 alpha가 복원됨")
+            
+            # 동적 모델이 정상 작동하는지 확인
+            out_dynamic_after = model(x)
+            dynamic_unchanged = torch.allclose(out_dynamic_before, out_dynamic_after, atol=1e-5)
+            assert dynamic_unchanged, "원본 모델의 동작이 변경됨"
+            print(f"  ✓ 원본 모델이 정상 작동함")
         
-        print(f"\n  ✓ 테스트 1 통과")
+        print(f"\n  ✓ 테스트 1 통과 (원본 모델 보호 확인)")
         
     except Exception as e:
         print(f"\n  ✗ 테스트 1 실패: {e}")
@@ -266,9 +288,10 @@ def test_w5_evaluate_test_integration():
         # W5Experiment의 evaluate_test 로직 시뮬레이션
         print("\n  시뮬레이션 단계:")
         print("    1. 동적 게이트 모델 평가")
-        print("    2. 게이트 고정 모델 평가")
-        print("    3. W5 지표 계산")
-        print("    4. 결과 병합")
+        print("    2. 게이트 고정 모델 평가 (Context Manager 사용)")
+        print("    3. 원본 모델 자동 복원")
+        print("    4. W5 지표 계산")
+        print("    5. 결과 병합")
         
         # 가상의 결과 생성 (evaluate_with_direct_evidence 결과 모방)
         dynamic_results = {
