@@ -63,6 +63,22 @@ class GateFixedModel:
     
     def load_state_dict(self, state_dict):
         return self.model.load_state_dict(state_dict)
+    
+    @property
+    def xhconv_blks(self):
+        """내부 모델의 xhconv_blks를 전달"""
+        return self.model.xhconv_blks
+    
+    def __getattr__(self, name):
+        """내부 모델의 속성에 접근 (conv_blks, resconv_blks 등)"""
+        # 무한 재귀 방지: 기본 속성들은 여기서 처리하지 않음
+        if name in ('model', 'gate_means', 'hooks'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        # 내부 모델의 속성 반환
+        try:
+            return getattr(self.model, name)
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
 class W5Experiment(BaseExperiment):

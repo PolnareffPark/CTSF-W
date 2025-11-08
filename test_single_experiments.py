@@ -4,6 +4,7 @@
 """
 
 import time
+import warnings
 from pathlib import Path
 from config.config import load_config, apply_HP2
 from experiments.w1_experiment import W1Experiment
@@ -13,6 +14,10 @@ from experiments.w4_experiment import W4Experiment
 from experiments.w5_experiment import W5Experiment
 from utils.error_logger import log_experiment_error
 import traceback
+
+# numpy 경고 억제 (표준편차가 0일 때 나누기 경고)
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid value encountered in divide')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid value encountered in scalar divide')
 
 
 def test_single_experiment(experiment_type, mode, dataset="ETTh1", horizon=96, seed=42):
@@ -116,6 +121,22 @@ def test_single_experiment(experiment_type, mode, dataset="ETTh1", horizon=96, s
         return False
 
 
+def format_time(seconds):
+    """시간을 보기 좋게 포맷 (d일 h시간 m분)"""
+    if seconds < 60:
+        return f"{seconds:.0f}초"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}분"
+    elif seconds < 86400:
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        return f"{hours}시간 {mins}분"
+    else:
+        days = int(seconds // 86400)
+        hours = int((seconds % 86400) // 3600)
+        return f"{days}일 {hours}시간"
+
+
 def main():
     """모든 실험 테스트"""
     print("=" * 80)
@@ -149,11 +170,12 @@ def main():
                 avg_time = elapsed / (completed_tests - 1)
                 remaining = total_tests - (completed_tests - 1)
                 eta = avg_time * remaining
-                eta_str = f"{eta/3600:.1f}h" if eta > 3600 else f"{eta/60:.1f}m"
+                eta_str = format_time(eta)
             else:
                 eta_str = "계산 중..."
             
-            print(f"\n[{completed_tests}/{total_tests}] {exp_type}-{mode} (예상 남은 시간: {eta_str})")
+            print(f"\n[{completed_tests}/{total_tests}] {exp_type}-{mode}")
+            print(f"   경과 시간: {format_time(elapsed)} | 예상 남은 시간: {eta_str}")
             results[exp_type][mode] = test_single_experiment(exp_type, mode)
             time.sleep(1)  # 간단한 대기
     
