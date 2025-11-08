@@ -4,7 +4,7 @@
 
 이 문서는 W5 실험(게이트 고정 시험)에 대한 평가 피드백을 반영한 수정 사항을 상세히 기록합니다.
 
-**수정 날짜**: 2025-11-07  
+**수정 날짜**: 2025-11-07 (1차), 2025-11-08 (2차)  
 **관련 실험**: W5 (게이트 고정 효과 검증)
 
 ---
@@ -69,7 +69,7 @@ def compute_w5_metrics(model, fixed_model_metrics=None, dynamic_model_metrics=No
 
 ---
 
-## ✅ 수정 내용
+## ✅ 수정 내용 (1차 - 2025-11-07)
 
 ### 1. W5Experiment.evaluate_test() 완전 재구성
 
@@ -167,6 +167,95 @@ def compute_w5_metrics(...) -> Dict:
 
 ---
 
+## ✅ 수정 내용 (2차 - 2025-11-08)
+
+### 4. 게이트 출력 수집 활성화
+
+**배경**:
+피드백에서 지적한 바와 같이, `w5_gate_event_alignment_loss` 지표가 게이트 변동성을 활용하지 못하고 fallback으로 이벤트 게인 차이만 사용하는 문제가 있었습니다.
+
+**수정된 코드**:
+
+```python
+# 1. 동적 게이트 모드 평가
+# 게이트 출력 수집을 활성화하여 게이트 변동성 지표 계산
+self.model.eval()
+dynamic_results = evaluate_with_direct_evidence(
+    self.model, self.test_loader, self.mu, self.std,
+    tod_vec=tod_vec, device=self.device,
+    collect_gate_outputs=True  # 추가!
+)
+
+# 2. 게이트 고정 모드 평가
+# 게이트 출력 수집을 활성화하여 고정 시 변동성이 0에 가까운지 확인
+fixed_model = GateFixedModel(self.model)
+fixed_model.eval()
+fixed_results = evaluate_with_direct_evidence(
+    fixed_model, self.test_loader, self.mu, self.std,
+    tod_vec=tod_vec, device=self.device,
+    collect_gate_outputs=True  # 추가!
+)
+```
+
+**변경 효과**:
+- ✅ `w2_gate_variability_time`, `w2_gate_variability_sample` 등 게이트 변동성 지표가 계산됨
+- ✅ `w5_gate_event_alignment_loss`가 정확한 계산식 사용
+  - 이전: `event_dynamic - event_fixed` (fallback)
+  - 이후: `(event_dynamic * gate_var_dynamic) - (event_fixed * gate_var_fixed)`
+- ✅ 고정 게이트의 변동성이 실제로 0에 가까운지 검증 가능
+
+### 5. run_suite.py 중복 실행 문제 해결
+
+**문제 상황**:
+피드백에서 지적한 바와 같이, W5 실험이 `modes=["dynamic", "fixed"]`로 두 번 실행되어 불필요한 중복이 발생했습니다. W5Experiment.evaluate_test()가 이미 한 번의 실행으로 동적/고정을 모두 평가하므로 두 번 실행할 필요가 없습니다.
+
+**수정된 코드**:
+
+```python
+# run_suite.py
+elif experiment_type == "W5":
+    # W5는 한 번 실행으로 동적/고정 비교를 모두 수행함
+    modes = ["dynamic"]
+```
+
+**변경 효과**:
+- ✅ 한 번의 실행으로 동적/고정 비교 완료
+- ✅ 실행 시간 절반으로 단축
+- ✅ CSV에 중복 행 생성 방지
+- ✅ 사용자 혼동 감소
+
+### 6. CSV 컬럼 확장
+
+**문제 상황**:
+1차 수정에서 `rmse_fixed`, `mae_fixed` 등을 결과에 추가했지만, CSV 컬럼 정의에 없어서 무시되는 문제가 있었습니다.
+
+**수정된 코드**:
+
+```python
+# utils/csv_logger.py
+"W5": [
+    "w5_performance_degradation_ratio", "w5_sensitivity_gain_loss",
+    "w5_event_gain_loss", "w5_gate_event_alignment_loss",
+    # 고정 모델 개별 지표 (분석 용이성)
+    "rmse_fixed", "mae_fixed", "gc_kernel_tod_dcor_fixed", "cg_event_gain_fixed",
+    # W2 게이트 변동성 지표 (동적 모델)
+    "w2_gate_variability_time", "w2_gate_variability_sample", "w2_gate_entropy",
+    "w2_gate_tod_alignment", "w2_gate_gru_state_alignment",
+    "w2_event_conditional_response",
+    "w2_channel_selectivity_kurtosis", "w2_channel_selectivity_sparsity",
+    # 보고용 그림 지표
+    "gate_var_t", "gate_var_b", "gate_entropy",
+    "gate_q10", "gate_q50", "gate_q90", "gate_hist10",
+],
+```
+
+**변경 효과**:
+- ✅ 고정 모델의 개별 성능 지표가 CSV에 기록됨
+- ✅ 게이트 변동성 지표가 CSV에 기록됨
+- ✅ 동적 vs 고정 비교 분석이 용이해짐
+
+---
+
 ## 📊 결과 구조 변화
 
 ### CSV 출력 컬럼
@@ -174,39 +263,62 @@ def compute_w5_metrics(...) -> Dict:
 **동적 모델 성능 (기본 컬럼)**:
 - `rmse`, `mae`, `mape`, `mse` 등
 
-**고정 모델 성능 (새로 추가)**:
+**고정 모델 성능 (1차 수정에서 추가, 2차에서 CSV 컬럼 정의)**:
 - `rmse_fixed`: 고정 게이트 모델의 RMSE
 - `mae_fixed`: 고정 게이트 모델의 MAE
 - `gc_kernel_tod_dcor_fixed`: 고정 게이트 모델의 TOD 민감도
 - `cg_event_gain_fixed`: 고정 게이트 모델의 이벤트 게인
 
-**W5 비교 지표 (새로 추가)**:
+**W5 비교 지표 (1차 수정에서 추가)**:
 - `w5_performance_degradation_ratio`: 성능 저하율
 - `w5_sensitivity_gain_loss`: TOD 민감도 손실
 - `w5_event_gain_loss`: 이벤트 탐지 손실
 - `w5_gate_event_alignment_loss`: 게이트-이벤트 정렬 손실
 
-### 예시 결과
+**게이트 변동성 지표 (2차 수정에서 추가)**:
+- `w2_gate_variability_time`: 시간 차원 게이트 변동성
+- `w2_gate_variability_sample`: 샘플 차원 게이트 변동성
+- `w2_gate_entropy`: 게이트 엔트로피
+- `w2_gate_tod_alignment`: 게이트-TOD 정렬
+- `w2_gate_gru_state_alignment`: 게이트-GRU 상태 정렬
+- `w2_event_conditional_response`: 이벤트 조건부 반응
+- `w2_channel_selectivity_kurtosis`: 채널 선택도 첨도
+- `w2_channel_selectivity_sparsity`: 채널 선택도 희소성
+
+### 예시 결과 (2차 수정 후)
 
 ```
+# 기본 성능 지표
 rmse: 1.234
 rmse_fixed: 1.456
 w5_performance_degradation_ratio: 0.180  # (1.456-1.234)/1.234 = 18% 성능 저하
 
+# TOD 민감도
 gc_kernel_tod_dcor: 0.723
 gc_kernel_tod_dcor_fixed: 0.512
 w5_sensitivity_gain_loss: 0.211  # 동적이 TOD 패턴을 더 잘 포착
 
+# 이벤트 탐지
 cg_event_gain: 0.634
 cg_event_gain_fixed: 0.421
 w5_event_gain_loss: 0.213  # 동적이 이벤트를 더 잘 탐지
+
+# 게이트 변동성 (2차 수정에서 추가)
+w2_gate_variability_time: 0.245  # 동적 게이트 시간 변동성
+w2_gate_entropy: 1.823  # 동적 게이트 엔트로피
+
+# 게이트-이벤트 정렬
+w5_gate_event_alignment_loss: 0.155  # 정확한 계산식 사용
+# = (0.634 * 0.245) - (0.421 * 0.001)  # 고정 게이트 변동성 ≈ 0
 ```
 
 **해석**:
 - 게이트를 고정하면 RMSE가 18% 증가 (성능 저하)
 - 동적 게이트는 시간대 패턴을 21.1% 더 잘 포착
 - 동적 게이트는 이벤트를 21.3% 더 잘 탐지
-- **결론**: 동적 게이트가 모델 성능에 중요한 기여를 함
+- 동적 게이트는 시간에 따라 변동하며 (variability=0.245), 이벤트에 반응함
+- 고정 게이트는 변동성이 거의 0에 가까워 이벤트에 반응하지 못함
+- **결론**: 동적 게이트가 모델 성능에 중요한 기여를 하며, 특히 이벤트 반응에 핵심적
 
 ---
 
@@ -277,7 +389,7 @@ python docs/experiment_modifications/test_w5_modifications.py
 
 ### 실행 방법
 
-**이전 (문제 있는 방식)**:
+**이전 (문제 있는 방식 - 1차 수정 전)**:
 ```bash
 # 동적 평가
 python run_suite.py --experiments W5 --datasets ETTh2 --horizons 96 --gate_fixed false
@@ -288,39 +400,56 @@ python run_suite.py --experiments W5 --datasets ETTh2 --horizons 96 --gate_fixed
 # 결과를 수동으로 비교해야 함
 ```
 
-**현재 (개선된 방식)**:
+**1차 수정 후 (동적/고정을 한 번에 평가하지만 중복 실행)**:
 ```bash
-# 한 번의 실행으로 모든 비교 완료
+# 한 번의 실행으로 동적/고정 비교 완료
 python run_suite.py --experiments W5 --datasets ETTh2 --horizons 96
 
-# CSV에 동적/고정/비교 지표가 모두 기록됨
+# 문제: modes=["dynamic", "fixed"]로 두 번 실행되어 중복 발생
+# CSV에 동일한 결과가 두 행으로 기록됨
+```
+
+**2차 수정 후 (최종 - 권장 방식)**:
+```bash
+# 한 번의 실행으로 모든 비교 완료 (중복 없음)
+python run_suite.py --experiments W5 --datasets ETTh2 --horizons 96
+
+# 또는 명시적으로 mode 지정
+python run_suite.py --experiments W5 --datasets ETTh2 --horizons 96 --modes dynamic
+
+# CSV에 한 행만 기록되며, 동적/고정/비교/변동성 지표 모두 포함
 ```
 
 ### 결과 확인
 
 ```bash
 # CSV 파일 확인
-cat results/results_W5/W5_results.csv
+cat results/results_W5.csv
 
-# 주요 컬럼:
+# 주요 컬럼 (2차 수정 후):
 # - rmse: 동적 게이트 RMSE
 # - rmse_fixed: 고정 게이트 RMSE
 # - w5_performance_degradation_ratio: 성능 저하율
 # - w5_sensitivity_gain_loss: 민감도 손실
 # - w5_event_gain_loss: 이벤트 손실
+# - w5_gate_event_alignment_loss: 게이트-이벤트 정렬 손실
+# - w2_gate_variability_time: 동적 게이트 시간 변동성
+# - w2_gate_entropy: 동적 게이트 엔트로피
 ```
 
 ---
 
 ## 📝 주요 변경 파일 요약
 
-| 파일 | 변경 내용 | 중요도 |
-|------|-----------|--------|
-| `experiments/w5_experiment.py` | evaluate_test() 완전 재구성, run_tag 단순화 | ★★★★★ |
-| `utils/experiment_metrics/w5_metrics.py` | docstring 개선, 지표 해석 추가 | ★★★☆☆ |
-| `docs/experiment_modifications/test_w5_modifications.py` | 테스트 스크립트 신규 작성 | ★★★★☆ |
-| `docs/experiment_modifications/W5_MODIFICATIONS_SUMMARY.md` | 상세 문서 신규 작성 | ★★★☆☆ |
-| `CHANGES_SUMMARY.md` | W5 수정 내역 추가 | ★★☆☆☆ |
+| 파일 | 변경 내용 | 중요도 | 수정 차수 |
+|------|-----------|--------|----------|
+| `experiments/w5_experiment.py` | evaluate_test() 완전 재구성, collect_gate_outputs 추가 | ★★★★★ | 1차, 2차 |
+| `run_suite.py` | W5 modes를 ["dynamic"]만 사용하도록 수정 | ★★★★☆ | 2차 |
+| `utils/csv_logger.py` | W5 CSV 컬럼 확장 (고정 지표, 게이트 변동성) | ★★★★☆ | 2차 |
+| `utils/experiment_metrics/w5_metrics.py` | docstring 개선, 지표 해석 추가 | ★★★☆☆ | 1차 |
+| `docs/experiment_modifications/test_w5_modifications.py` | 테스트 스크립트 신규 작성 | ★★★★☆ | 1차 |
+| `docs/experiment_modifications/W5_MODIFICATIONS_SUMMARY.md` | 상세 문서 (1차, 2차 수정 내역) | ★★★☆☆ | 1차, 2차 |
+| `CHANGES_SUMMARY.md` | W5 수정 내역 (1차, 2차) | ★★☆☆☆ | 1차, 2차 |
 
 ---
 

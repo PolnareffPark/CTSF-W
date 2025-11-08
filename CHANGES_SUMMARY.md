@@ -1,6 +1,35 @@
 ## 📝 최근 변경 내역
 
-### 2025-11-07: W5 실험 코드 개선 (평가 피드백 반영)
+### 2025-11-07: W5 실험 코드 개선 (평가 피드백 반영 - 2차)
+
+#### 1. 게이트 출력 수집 활성화
+- **파일**: `experiments/w5_experiment.py`
+- **변경**: 동적/고정 모델 평가 시 `collect_gate_outputs=True` 추가
+- **효과**:
+  - 게이트 변동성 지표(`w2_gate_variability_time` 등)가 정상적으로 계산됨
+  - `w5_gate_event_alignment_loss`가 이벤트 게인 차이 fallback 대신 정확한 계산식 사용
+  - 고정 게이트의 변동성이 실제로 0에 가까운지 검증 가능
+
+#### 2. run_suite.py 중복 실행 문제 해결
+- **파일**: `run_suite.py`
+- **문제**: W5 실험이 `modes=["dynamic", "fixed"]`로 두 번 실행되어 불필요한 중복
+- **해결**: W5 기본 모드를 `["dynamic"]`만 사용하도록 수정
+- **효과**:
+  - 한 번의 실행으로 동적/고정 비교 완료
+  - 실행 시간 절반으로 단축
+  - CSV에 중복 행 생성 방지
+
+#### 3. CSV 컬럼 확장
+- **파일**: `utils/csv_logger.py`
+- **변경**: W5 결과 CSV에 컬럼 추가
+- **추가된 컬럼**:
+  - 고정 모델 지표: `rmse_fixed`, `mae_fixed`, `gc_kernel_tod_dcor_fixed`, `cg_event_gain_fixed`
+  - W2 게이트 변동성 지표: `w2_gate_variability_time`, `w2_gate_variability_sample`, `w2_gate_entropy` 등
+- **효과**: 동적/고정 모델의 개별 성능과 게이트 변동성을 CSV에서 직접 확인 가능
+
+---
+
+### 2025-11-07: W5 실험 코드 개선 (평가 피드백 반영 - 1차)
 
 #### 1. W5Experiment.evaluate_test() 완전 재구성
 - **파일**: `experiments/w5_experiment.py`
@@ -48,13 +77,13 @@
   - `test_w5_evaluate_test_integration()`: evaluate_test 통합 로직 검증
 - **실행**: `python docs/experiment_modifications/test_w5_modifications.py`
 
-#### 5. 실험 실행 방식 변경
+#### 5. 실험 실행 방식 변경 (1차 수정)
 - **이전**: `gate_fixed=False`와 `gate_fixed=True`로 두 번 실행 필요
 - **현재**: 한 번의 실행으로 동적과 고정 비교 완료
 - **run_tag**: `W5-dynamic` / `W5-fixed` → `W5`로 단순화
 - **CSV 출력**: 
   - 동적 모델 지표 (rmse, mae, ...)
-  - 고정 모델 지표 (rmse_fixed, mae_fixed, ...)
+  - 고정 모델 지표 (rmse_fixed, mae_fixed, ...) - 2차 수정에서 CSV 컬럼 추가
   - W5 비교 지표 (w5_performance_degradation_ratio, ...)
 
 ---

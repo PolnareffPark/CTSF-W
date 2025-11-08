@@ -73,6 +73,13 @@ def save_results_unified(row: dict, out_root: str = "results", experiment_type: 
         "W5": [
             "w5_performance_degradation_ratio", "w5_sensitivity_gain_loss",
             "w5_event_gain_loss", "w5_gate_event_alignment_loss",
+            # 고정 모델 개별 지표 (분석 용이성)
+            "rmse_fixed", "mae_fixed", "gc_kernel_tod_dcor_fixed", "cg_event_gain_fixed",
+            # W2 게이트 변동성 지표 (동적 모델)
+            "w2_gate_variability_time", "w2_gate_variability_sample", "w2_gate_entropy",
+            "w2_gate_tod_alignment", "w2_gate_gru_state_alignment",
+            "w2_event_conditional_response",
+            "w2_channel_selectivity_kurtosis", "w2_channel_selectivity_sparsity",
             # 보고용 그림 지표
             "gate_var_t", "gate_var_b", "gate_entropy",  # 게이트 분포
             "gate_q10", "gate_q50", "gate_q90", "gate_hist10",  # 게이트 분위수/히스토

@@ -99,18 +99,22 @@ class W5Experiment(BaseExperiment):
         tod_vec = build_test_tod_vector(self.cfg)
         
         # 1. 동적 게이트 모드 평가 (원래 모델 그대로)
+        # 게이트 출력 수집을 활성화하여 게이트 변동성 지표 계산
         self.model.eval()
         dynamic_results = evaluate_with_direct_evidence(
             self.model, self.test_loader, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device
+            tod_vec=tod_vec, device=self.device,
+            collect_gate_outputs=True
         )
         
         # 2. 게이트 고정 모드 평가
+        # 게이트 출력 수집을 활성화하여 고정 시 변동성이 0에 가까운지 확인
         fixed_model = GateFixedModel(self.model)
         fixed_model.eval()
         fixed_results = evaluate_with_direct_evidence(
             fixed_model, self.test_loader, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device
+            tod_vec=tod_vec, device=self.device,
+            collect_gate_outputs=True
         )
         
         # 3. W5 특화 비교 지표 계산

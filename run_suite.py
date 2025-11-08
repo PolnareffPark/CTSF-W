@@ -79,7 +79,8 @@ def run_experiment_suite(
         elif experiment_type == "W4":
             modes = ["all", "shallow", "mid", "deep"]
         elif experiment_type == "W5":
-            modes = ["dynamic", "fixed"]
+            # W5는 한 번 실행으로 동적/고정 비교를 모두 수행함
+            modes = ["dynamic"]
         else:
             modes = ["default"]
     
