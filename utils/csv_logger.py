@@ -29,7 +29,7 @@ def save_results_unified(row: dict, out_root: str = "results", experiment_type: 
     # 컬럼 순서 정의 (공통 지표 + 실험별 특화 지표)
     base_cols = [
         "dataset", "horizon", "seed", "mode", "model_tag", "experiment_type",
-        "mse_std", "mse_real", "rmse", "mae",
+        "mse_std", "mse_real", "rmse", "mae", "mae_std",
         # Conv→GRU
         "cg_pearson_mean", "cg_spearman_mean", "cg_dcor_mean",
         "cg_event_gain", "cg_event_hit", "cg_maxcorr", "cg_bestlag",

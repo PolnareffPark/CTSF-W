@@ -45,6 +45,8 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
     
     # W3 실험용 배치별 RMSE 수집 (표준편차 계산용)
     batch_rmse_list = []
+    # 배치별 MAE 수집 (표준편차 계산용)
+    batch_mae_list = []
 
     # Conv→GRU
     cg_p_list, cg_s_list, cg_dcor_list = [], [], []
@@ -95,6 +97,10 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
         batch_mse = ((pred_real_np - yb_real_np) ** 2).mean()
         batch_rmse = float(np.sqrt(batch_mse))
         batch_rmse_list.append(batch_rmse)
+        
+        # 배치별 MAE 계산 (표준편차 계산용)
+        batch_mae = float(np.abs(pred_real_np - yb_real_np).mean())
+        batch_mae_list.append(batch_mae)
 
         # 내부 신호 (마지막 블록)
         C_pre = hooks.C_last_pre
@@ -152,8 +158,14 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
     mse_real = float(((P - T) ** 2).mean())
     rmse = float(np.sqrt(mse_real))
     
+    # MAE 계산 (실측 스케일)
+    mae = float(np.abs(P - T).mean())
+    
     # 배치별 RMSE의 표준편차 (W3 실험용 Cohen's d 계산에 사용)
     rmse_std = float(np.std(batch_rmse_list)) if len(batch_rmse_list) > 1 else 0.0
+    
+    # 배치별 MAE의 표준편차
+    mae_std = float(np.std(batch_mae_list)) if len(batch_mae_list) > 1 else 0.0
     
     # W3 실험용: 윈도우별 오차 벡터 (N,) - per-window MSE
     # P, T는 (N, C, H) 형태, C와 H 축에 대해 평균하여 윈도우별 스칼라 오차로 변환
@@ -214,6 +226,7 @@ def evaluate_with_direct_evidence(model, loader, mu, std, tod_vec=None, device=N
 
     result = dict(
         mse_std=mse_std, mse_real=mse_real, rmse=rmse, rmse_std=rmse_std,
+        mae=mae, mae_std=mae_std,
         win_errors=win_errors,  # W3용: 윈도우별 오차 벡터
         # Conv → GRU
         cg_pearson_mean=cg_pearson_mean,
