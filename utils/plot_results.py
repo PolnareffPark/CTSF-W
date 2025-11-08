@@ -14,6 +14,9 @@ def save_plot_data(
     dataset: str,
     plot_type: str,
     plot_data: Dict,
+    horizon: Optional[int],
+    seed: Optional[int],
+    mode: Optional[str],
     results_root: str = "results"
 ):
     """
@@ -24,6 +27,9 @@ def save_plot_data(
         dataset: 데이터셋 이름 (예: 'ETTm2')
         plot_type: 그림 타입 (예: 'forest_plot', 'heatmap', 'histogram')
         plot_data: 그림 데이터 딕셔너리
+        horizon: 예측 horizon
+        seed: 실험 시드
+        mode: 실험 모드
         results_root: 결과 루트 디렉토리
     """
     results_root = Path(results_root)
@@ -38,22 +44,47 @@ def save_plot_data(
     else:
         df = pd.DataFrame()
     
-    # 새 데이터 추가
+    # 필수 메타 컬럼 보강
+    for col in ["experiment_type", "dataset", "plot_type", "horizon", "seed", "mode"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # 누락된 메타데이터 기본값 보정
+    if not df.empty:
+        df["horizon"] = df["horizon"].fillna(-1)
+        df["seed"] = df["seed"].fillna(-1)
+        df["mode"] = df["mode"].fillna("default").astype(str)
+    
+    # 새 데이터 구성
     new_row = {
         "experiment_type": experiment_type,
         "dataset": dataset,
         "plot_type": plot_type,
+        "horizon": int(horizon) if horizon is not None else -1,
+        "seed": int(seed) if seed is not None else -1,
+        "mode": str(mode) if mode is not None else "default",
         **plot_data
     }
-    
     new_df = pd.DataFrame([new_row])
     
-    # 중복 제거 (experiment_type, dataset, plot_type, 추가 키로)
-    if not df.empty:
-        # 간단히 append (실제로는 더 정교한 중복 제거 필요)
-        df = pd.concat([df, new_df], ignore_index=True)
-    else:
+    # 병합 및 중복 제거
+    if df.empty:
         df = new_df
+    else:
+        df = pd.concat([df, new_df], ignore_index=True)
+        df = df.drop_duplicates(
+            subset=["experiment_type", "dataset", "plot_type", "horizon", "seed", "mode"],
+            keep="last"
+        )
+    
+    # -1 값은 결측치로 되돌림
+    df["horizon"] = df["horizon"].replace(-1, pd.NA)
+    df["seed"] = df["seed"].replace(-1, pd.NA)
+    
+    # 열 순서 정리
+    meta_cols = ["experiment_type", "dataset", "plot_type", "horizon", "seed", "mode"]
+    other_cols = [c for c in df.columns if c not in meta_cols]
+    df = df[meta_cols + other_cols]
     
     df.to_csv(csv_path, index=False)
     

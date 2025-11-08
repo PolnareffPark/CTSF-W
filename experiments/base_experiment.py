@@ -324,6 +324,9 @@ class BaseExperiment:
                     dataset=self.dataset_tag,
                     plot_type=plot_type,
                     plot_data=plot_data,
+                    horizon=int(self.cfg.get("horizon", 0)),
+                    seed=int(self.cfg.get("seed", 0)),
+                    mode=self.cfg.get("mode", "default"),
                     results_root=str(self.out_root)
                 )
         
