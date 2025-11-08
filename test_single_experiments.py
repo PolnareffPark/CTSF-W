@@ -31,10 +31,6 @@ def test_single_experiment(experiment_type, mode, dataset="ETTh1", horizon=96, s
         horizon: 테스트용 horizon (96 - 가장 빠름)
         seed: 테스트용 시드 (42)
     """
-    print(f"\n{'='*80}")
-    print(f"테스트: {experiment_type} - {mode}")
-    print(f"{'='*80}")
-    
     # 설정 로드
     base_cfg = load_config("hp2_config.yaml")
     
@@ -67,7 +63,7 @@ def test_single_experiment(experiment_type, mode, dataset="ETTh1", horizon=96, s
     # 실험별 설정
     cfg["experiment_type"] = experiment_type
     cfg["mode"] = mode
-    cfg["verbose"] = True
+    cfg["verbose"] = False  # tqdm 억제
     
     if experiment_type == "W3":
         cfg["perturbation"] = mode if mode != "none" else None
@@ -94,13 +90,9 @@ def test_single_experiment(experiment_type, mode, dataset="ETTh1", horizon=96, s
             raise ValueError(f"Unknown experiment_type: {experiment_type}")
         
         exp.run()
-        elapsed = time.time() - start_time
-        
-        print(f"\n✅ 성공 - 소요 시간: {elapsed/60:.1f}분 ({elapsed:.1f}초)")
         return True
         
     except Exception as e:
-        elapsed = time.time() - start_time
         error_tb = traceback.format_exc()
         
         # 오류 로깅
@@ -115,9 +107,7 @@ def test_single_experiment(experiment_type, mode, dataset="ETTh1", horizon=96, s
             results_root="results_test"
         )
         
-        print(f"\n❌ 실패 - 소요 시간: {elapsed/60:.1f}분 ({elapsed:.1f}초)")
-        print(f"오류: {e}")
-        print(f"트레이스백:\n{error_tb}")
+        print(f"✗ 에러: {str(e)[:80]}")
         return False
 
 
@@ -140,10 +130,7 @@ def format_time(seconds):
 def main():
     """모든 실험 테스트"""
     print("=" * 80)
-    print("CTSF-W 실험 단일 테스트")
-    print("=" * 80)
-    print("설정: dataset=ETTh1, horizon=96, seed=42")
-    print("테스트용 epochs=5 (빠른 검증)")
+    print("CTSF-W 통합 테스트 시작 (ETTh1, H=96, epochs=5)")
     print("=" * 80)
     
     total_start = time.time()
@@ -160,50 +147,46 @@ def main():
     completed_tests = 0
     
     for exp_type, modes in test_plan:
-        print(f"\n[{exp_type} 실험 테스트]")
         results[exp_type] = {}
         for mode in modes:
+            # 실험 실행 (내부 출력 억제됨)
+            success = test_single_experiment(exp_type, mode)
+            results[exp_type][mode] = success
             completed_tests += 1
-            # 진행 상황 및 예상 시간 출력
+            
+            # 완료 후 진행률 표시 (한 줄로 업데이트)
             elapsed = time.time() - total_start
-            if completed_tests > 1:
-                avg_time = elapsed / (completed_tests - 1)
-                remaining = total_tests - (completed_tests - 1)
+            if completed_tests > 0:
+                avg_time = elapsed / completed_tests
+                remaining = total_tests - completed_tests
                 eta = avg_time * remaining
                 eta_str = format_time(eta)
             else:
                 eta_str = "계산 중..."
             
-            print(f"\n[{completed_tests}/{total_tests}] {exp_type}-{mode}")
-            print(f"   경과 시간: {format_time(elapsed)} | 예상 남은 시간: {eta_str}")
-            results[exp_type][mode] = test_single_experiment(exp_type, mode)
-            time.sleep(1)  # 간단한 대기
-    
-    total_time = time.time() - total_start
+            progress_pct = (completed_tests / total_tests) * 100
+            status = "✓" if success else "✗"
+            
+            # 완료 상태를 한 줄로 표시
+            print(f"\r진행: {completed_tests}/{total_tests} ({progress_pct:.1f}%) | 경과: {format_time(elapsed)} | 남은시간: {eta_str} | {exp_type}-{mode} {status}    ", end="", flush=True)
     
     # 최종 요약
     print("\n" + "=" * 80)
-    print("테스트 완료 요약")
+    print("테스트 완료")
     print("=" * 80)
-    print(f"총 소요 시간: {total_time/3600:.2f}시간 ({total_time:.1f}초)")
-    print("\n실험별 결과:")
     
     all_passed = True
     for exp_type, modes in results.items():
         passed = sum(1 for v in modes.values() if v)
         total = len(modes)
-        status = "✅" if passed == total else "⚠️"
-        print(f"  {status} {exp_type}: {passed}/{total} 성공")
+        status = "✅" if passed == total else "❌"
+        print(f"{status} {exp_type}: {passed}/{total}", end="")
         if passed != total:
             all_passed = False
-            for mode, success in modes.items():
-                if not success:
-                    print(f"      - {mode}: 실패")
-    
-    if all_passed:
-        print("\n✅ 모든 테스트가 성공적으로 완료되었습니다!")
-    else:
-        print("\n⚠️  일부 테스트가 실패했습니다. results_test/errors_*.json을 확인하세요.")
+            failed = [m for m, v in modes.items() if not v]
+            print(f" (실패: {', '.join(failed)})")
+        else:
+            print()
     
     print("=" * 80)
 

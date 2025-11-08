@@ -131,7 +131,9 @@ class W3Experiment(BaseExperiment):
         cfg_baseline["perturbation"] = "none"
         _, _, test_loader_baseline, _ = load_split_dataloaders(cfg_baseline)
         
-        print(f"[W3] Evaluating baseline (no perturbation)...")
+        # verbose 모드일 때만 출력
+        if self.cfg.get("verbose", True):
+            print(f"[W3] Evaluating baseline (no perturbation)...")
         baseline_direct = evaluate_with_direct_evidence(
             self.model, test_loader_baseline, self.mu, self.std,
             tod_vec=tod_vec, device=self.device,
@@ -142,7 +144,8 @@ class W3Experiment(BaseExperiment):
         baseline_direct.pop('hooks_data', None)
         
         # 2. 교란 평가
-        print(f"[W3] Evaluating with perturbation: {self.perturbation}...")
+        if self.cfg.get("verbose", True):
+            print(f"[W3] Evaluating with perturbation: {self.perturbation}...")
         
         # 교란된 test_loader 생성
         test_loader_perturbed = PerturbedDataLoader(
@@ -179,13 +182,14 @@ class W3Experiment(BaseExperiment):
         for k, v in exp_specific.items():
             current_direct[k] = v
         
-        # 6. 출력
-        print(f"[W3] Baseline RMSE: {baseline_direct['rmse']:.4f}, Perturbed RMSE: {current_direct['rmse']:.4f}")
-        if 'w3_intervention_effect_rmse' in exp_specific:
-            print(f"[W3] Intervention effect (ΔRMSE%): {exp_specific['w3_intervention_effect_rmse']*100:.2f}%")
-        if 'w3_intervention_cohens_d' in exp_specific:
-            print(f"[W3] Cohen's d_z: {exp_specific['w3_intervention_cohens_d']:.4f}")
-        if 'w3_rmse_win_rate' in exp_specific:
-            print(f"[W3] Win-rate (교란>기준): {exp_specific['w3_rmse_win_rate']*100:.1f}%")
+        # 6. 출력 (verbose 모드일 때만)
+        if self.cfg.get("verbose", True):
+            print(f"[W3] Baseline RMSE: {baseline_direct['rmse']:.4f}, Perturbed RMSE: {current_direct['rmse']:.4f}")
+            if 'w3_intervention_effect_rmse' in exp_specific:
+                print(f"[W3] Intervention effect (ΔRMSE%): {exp_specific['w3_intervention_effect_rmse']*100:.2f}%")
+            if 'w3_intervention_cohens_d' in exp_specific:
+                print(f"[W3] Cohen's d_z: {exp_specific['w3_intervention_cohens_d']:.4f}")
+            if 'w3_rmse_win_rate' in exp_specific:
+                print(f"[W3] Win-rate (교란>기준): {exp_specific['w3_rmse_win_rate']*100:.1f}%")
         
         return current_direct

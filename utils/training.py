@@ -36,7 +36,10 @@ def train_one_epoch(model, loader, opt, mu, std, epoch, cfg, device):
     model.train()
     tot = mse_sum = mse_real = cnt = 0
     
-    for xb, yb in tqdm(loader, desc=f"Train {epoch:02d}", leave=False):
+    # verbose 모드가 아니면 tqdm 억제
+    disable_tqdm = not cfg.get("verbose", True)
+    
+    for xb, yb in tqdm(loader, desc=f"Train {epoch:02d}", leave=False, disable=disable_tqdm):
         xb, yb = xb.to(device), yb.to(device)
 
         pred = model(xb)
@@ -57,13 +60,16 @@ def train_one_epoch(model, loader, opt, mu, std, epoch, cfg, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, mu, std, tag="Val", epoch=None, device=None, metrics=False):
+def evaluate(model, loader, mu, std, tag="Val", epoch=None, device=None, metrics=False, cfg=None):
     """평가"""
     model.eval()
     tot = mse_sum = mse_real = cnt = 0
     pr, tg = [], []
+    
+    # verbose 모드가 아니면 tqdm 억제
+    disable_tqdm = not cfg.get("verbose", True) if cfg else False
 
-    for xb, yb in tqdm(loader, desc=f"{tag}", leave=False):
+    for xb, yb in tqdm(loader, desc=f"{tag}", leave=False, disable=disable_tqdm):
         xb, yb = xb.to(device), yb.to(device)
 
         pred = model(xb)

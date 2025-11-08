@@ -32,16 +32,36 @@ def run_all_experiments(
     experiments = ["W1", "W2", "W3", "W4", "W5"]
     total_start = time.time()
     exp_times = {}
+    completed_exp = 0
     
     print("=" * 80)
     print(f"전체 실험 시작: {len(experiments)}개 실험")
     print("=" * 80)
     
-    for exp_type in experiments:
+    for exp_idx, exp_type in enumerate(experiments, 1):
         exp_start = time.time()
-        print(f"\n{'='*80}")
-        print(f"[{exp_type}] 실험 시작")
-        print(f"{'='*80}")
+        
+        # 전체 진행률 및 예상 시간
+        elapsed = time.time() - total_start
+        if completed_exp > 0:
+            avg_time = elapsed / completed_exp
+            remaining_exp = len(experiments) - completed_exp
+            eta_seconds = avg_time * remaining_exp
+            
+            if eta_seconds < 3600:
+                eta_str = f"{eta_seconds/60:.1f}분"
+            elif eta_seconds < 86400:
+                hours = int(eta_seconds // 3600)
+                mins = int((eta_seconds % 3600) // 60)
+                eta_str = f"{hours}시간 {mins}분"
+            else:
+                days = int(eta_seconds // 86400)
+                hours = int((eta_seconds % 86400) // 3600)
+                eta_str = f"{days}일 {hours}시간"
+        else:
+            eta_str = "계산 중..."
+        
+        print(f"\n[{exp_idx}/{len(experiments)}] {exp_type} 실험 시작 | 남은 시간: {eta_str}")
         
         try:
             # 각 실험별 기본 모드 설정
@@ -71,43 +91,33 @@ def run_all_experiments(
                 device=device,
                 config_path=config_path,
                 dry_run=dry_run,
-                verbose=verbose
+                verbose=False  # 진행률은 외부에서 표시
             )
             
             exp_time = time.time() - exp_start
             exp_times[exp_type] = exp_time
-            print(f"\n[{exp_type}] 완료 - 소요 시간: {exp_time/3600:.2f}시간 ({exp_time:.1f}초)")
+            completed_exp += 1
+            print(f"✓ {exp_type} 완료")
             
         except Exception as e:
             exp_time = time.time() - exp_start
             exp_times[exp_type] = exp_time
-            print(f"\n[{exp_type}] 실패 - 소요 시간: {exp_time/3600:.2f}시간 ({exp_time:.1f}초)")
-            print(f"오류: {e}")
-            import traceback
-            traceback.print_exc()
+            completed_exp += 1
+            print(f"✗ {exp_type} 실패: {str(e)[:80]}")
             # 다음 실험 계속 진행
             continue
     
-    total_time = time.time() - total_start
-    
     # 최종 요약
     print("\n" + "=" * 80)
-    print("전체 실험 완료 요약")
+    print("전체 실험 완료")
     print("=" * 80)
-    print(f"총 소요 시간: {total_time/3600:.2f}시간 ({total_time:.1f}초)")
-    print("\n실험별 소요 시간:")
-    for exp_type, exp_time in exp_times.items():
-        print(f"  {exp_type}: {exp_time/3600:.2f}시간 ({exp_time:.1f}초)")
     
-    # 오류 요약
+    # 오류 확인
     all_errors = read_experiment_errors(results_root=results_root)
     if all_errors:
-        print(f"\n⚠️  실패한 실험: {len(all_errors)}개")
-        print("상세 내용은 results/errors_W*.json 파일을 확인하세요.")
-        for err in all_errors[-5:]:  # 최근 5개만 출력
-            print(f"  - {err['experiment_type']} | {err['dataset']} | H={err['horizon']} | s={err['seed']} | {err['mode']}")
+        print(f"❌ 실패한 작업: {len(all_errors)}개 (상세: {results_root}/errors_W*.json)")
     else:
-        print("\n✅ 모든 실험이 성공적으로 완료되었습니다.")
+        print("✅ 모든 실험 완료")
     
     print("=" * 80)
 

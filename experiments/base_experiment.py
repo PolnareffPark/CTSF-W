@@ -90,7 +90,9 @@ class BaseExperiment:
             start_ep = ckpt["epoch"] + 1
             best_val = ckpt.get("best_val", float("inf"))
             best_state_cpu = ckpt.get("best_model", None)
-            print(f"[resume] {self.ckpt_path.name} @ epoch {ckpt['epoch']} (best_val={best_val:.6f})")
+            # verbose 모드일 때만 출력
+            if self.cfg.get("verbose", True):
+                print(f"[resume] {self.ckpt_path.name} @ epoch {ckpt['epoch']} (best_val={best_val:.6f})")
         
         if best_state_cpu is None:
             best_state_cpu = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
@@ -105,7 +107,7 @@ class BaseExperiment:
             
             val_loss, _, _, _ = evaluate(
                 self.model, self.val_loader, self.mu, self.std,
-                tag="Val", epoch=ep, device=self.device, metrics=False
+                tag="Val", epoch=ep, device=self.device, metrics=False, cfg=self.cfg
             )
             # 간단한 로그만 출력 (전체 실험 시 과도한 출력 방지)
             if self.cfg.get("verbose", True):
@@ -126,7 +128,8 @@ class BaseExperiment:
             }, self.ckpt_path)
             
             if self.stopper.step(val_loss):
-                print(f"[early stop] stop @ {ep}")
+                if self.cfg.get("verbose", True):
+                    print(f"[early stop] stop @ {ep}")
                 break
         
         # Best 모델 로드
@@ -290,7 +293,9 @@ class BaseExperiment:
             **direct_metrics
         }
         fpath = save_results_unified(row, out_root=str(self.out_root), experiment_type=self.experiment_type)
-        print(f"[saved] {fpath}")
+        # verbose 모드일 때만 출력
+        if self.cfg.get("verbose", True):
+            print(f"[saved] {fpath}")
         
         # 보고용 그림 데이터 저장
         # 주의: 그림 데이터만 저장하며, 실제 그림 그리기 코드는 포함되지 않음

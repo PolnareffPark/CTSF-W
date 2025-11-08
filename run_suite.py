@@ -181,24 +181,6 @@ def run_experiment_suite(
     
     # 실행
     for job_idx, (ds, H, s, md) in enumerate(plan, 1):
-        job_start_time = time.time()
-        
-        # 진행 상황 출력
-        elapsed = time.time() - suite_start_time
-        if completed > 0 and total_jobs > 0:
-            avg_time_per_job = elapsed / completed
-            remaining_jobs = total_jobs - completed
-            eta_seconds = avg_time_per_job * remaining_jobs
-            eta_str = f"{eta_seconds/3600:.1f}h" if eta_seconds > 3600 else f"{eta_seconds/60:.1f}m"
-        else:
-            eta_str = "계산 중..."
-        
-        if verbose:
-            print(f"\n=== [{job_idx}/{total_jobs}] RUN :: exp={experiment_type} | ds={ds} | H={H} | seed={s} | mode={md} ===")
-            print(f"진행: {completed}/{total_jobs} 완료 | 경과: {elapsed/3600:.2f}h | 예상 남은 시간: {eta_str}")
-        else:
-            print(f"[{job_idx}/{total_jobs}] {experiment_type} {ds} H={H} s={s} {md}... (예상 남은 시간: {eta_str})", end=" ", flush=True)
-        
         try:
             cfg = apply_HP2(
                 base_cfg,
@@ -213,7 +195,7 @@ def run_experiment_suite(
             # 실험별 모드 설정
             cfg["mode"] = md
             cfg["experiment_type"] = experiment_type
-            cfg["verbose"] = verbose
+            cfg["verbose"] = False  # tqdm 억제 (진행률은 외부에서 표시)
             if experiment_type == "W3":
                 cfg["perturbation"] = md if md != "none" else None
                 cfg["perturbation_kwargs"] = {}  # 필요시 추가
@@ -222,7 +204,7 @@ def run_experiment_suite(
             elif experiment_type == "W5":
                 cfg["gate_fixed"] = (md == "fixed")
             
-            # 실험 실행
+            # 실험 실행 (내부 출력 억제됨)
             if experiment_type == "W1":
                 exp = W1Experiment(cfg)
             elif experiment_type == "W2":
@@ -238,12 +220,34 @@ def run_experiment_suite(
             
             exp.run()
             completed += 1
-            job_time = time.time() - job_start_time
             
-            if not verbose:
-                print(f"✓ ({job_time/60:.1f}m)")
-            elif verbose:
-                print(f"완료 - 소요 시간: {job_time/60:.1f}분")
+            # 완료 후 진행률 표시 (한 줄로 업데이트)
+            elapsed = time.time() - suite_start_time
+            if completed > 0:
+                avg_time = elapsed / completed
+                remaining = total_jobs - completed
+                eta = avg_time * remaining
+                
+                if eta < 60:
+                    eta_str = f"{eta:.0f}초"
+                elif eta < 3600:
+                    eta_str = f"{eta/60:.1f}분"
+                elif eta < 86400:
+                    hours = int(eta // 3600)
+                    mins = int((eta % 3600) // 60)
+                    eta_str = f"{hours}시간 {mins}분"
+                else:
+                    days = int(eta // 86400)
+                    hours = int((eta % 86400) // 3600)
+                    eta_str = f"{days}일 {hours}시간"
+                
+                elapsed_str = f"{elapsed/3600:.1f}h" if elapsed > 3600 else f"{elapsed/60:.1f}m"
+            else:
+                eta_str = "계산 중..."
+                elapsed_str = "0m"
+            
+            progress_pct = (completed / total_jobs) * 100
+            print(f"\r진행: {completed}/{total_jobs} ({progress_pct:.1f}%) | 경과: {elapsed_str} | 남은시간: {eta_str} | {experiment_type} {ds} H{H} s{s} {md} ✓    ", end="", flush=True)
         
         except Exception as e:
             # 오류 로깅
@@ -259,11 +263,10 @@ def run_experiment_suite(
                 results_root=results_root
             )
             
-            if verbose:
-                print(f"[ERROR] {ds}-H{H}-s{s}-{md} failed: {e}")
-                print(error_tb)
-            else:
-                print(f"✗ ({str(e)[:50]})")
+            # 실패 상태 표시
+            elapsed = time.time() - suite_start_time
+            elapsed_str = f"{elapsed/3600:.1f}h" if elapsed > 3600 else f"{elapsed/60:.1f}m"
+            print(f"\r진행: {completed}/{total_jobs} | 경과: {elapsed_str} | {experiment_type} {ds} H{H} s{s} {md} ✗ ({str(e)[:50]})    ", end="", flush=True)
             continue
 
 
