@@ -1,0 +1,2 @@
+experiment_type,plot_type,dataset,horizon,seed,rmse_per,rmse_last,delta_rmse,delta_rmse_pct,delta_cka_global,delta_grad_align_all,top_pick_score
+W1,forest_plot,ETTh1,96,42,3.06516181331973,3.1955430523582526,0.1303812390385226,4.080096462549726,0.4102867619503668,0.0035261478506528,0.0

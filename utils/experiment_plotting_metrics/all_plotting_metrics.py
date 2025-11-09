@@ -314,13 +314,18 @@ def build_forest_from_results(
         base["delta_grad_align_all"] = _delta_or_nan(grad_col)
 
     # Top-pick(무가중치 z-합; 그룹=dataset×horizon)
-    def _compute_top(g: pd.DataFrame) -> pd.DataFrame:
-        z_rmse = _zscore(g["delta_rmse_pct"])
-        z_cka  = _zscore(g["delta_cka_global"]) if "delta_cka_global" in g else pd.Series(0, index=g.index)
-        z_gal  = _zscore(g["delta_grad_align_all"]) if "delta_grad_align_all" in g else pd.Series(0, index=g.index)
-        g["top_pick_score"] = z_rmse + z_cka + z_gal
-        return g
-    base = base.groupby(["dataset","horizon"], group_keys=False).apply(_compute_top)
+    grouped_frames = []
+    for _, grp in base.groupby(["dataset", "horizon"], sort=False):
+        grp = grp.copy()
+        z_rmse = _zscore(grp["delta_rmse_pct"])
+        z_cka  = _zscore(grp["delta_cka_global"]) if "delta_cka_global" in grp else pd.Series(0, index=grp.index)
+        z_gal  = _zscore(grp["delta_grad_align_all"]) if "delta_grad_align_all" in grp else pd.Series(0, index=grp.index)
+        grp["top_pick_score"] = z_rmse + z_cka + z_gal
+        grouped_frames.append(grp)
+    if grouped_frames:
+        base = pd.concat(grouped_frames, ignore_index=True)
+    else:
+        base = base.assign(top_pick_score=np.nan)
 
     # summary
     cols = [

@@ -48,10 +48,13 @@
 # =====================================================================
 
 from __future__ import annotations
+import contextlib
+import math
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
+from utils.training import evaluate
 
 from utils.experiment_plotting_metrics.all_plotting_metrics import (
     REQUIRED_KEYS,
@@ -76,6 +79,36 @@ def _nanmean(a) -> float:
         return float(_np.nanmean(a))
     except Exception:
         return _np.nan
+
+
+@contextlib.contextmanager
+def _disable_cross_at(model, layer_idx: int):
+    blk = model.xhconv_blks[layer_idx]
+    if not hasattr(blk, "use_gc") or not hasattr(blk, "use_cg"):
+        yield
+        return
+    prev_gc, prev_cg = blk.use_gc, blk.use_cg
+    blk.use_gc = False
+    blk.use_cg = False
+    try:
+        yield
+    finally:
+        blk.use_gc = prev_gc
+        blk.use_cg = prev_cg
+
+
+def _evaluate_rmse(model, loader, mu, std, device) -> float:
+    _, _, mse_real, _ = evaluate(
+        model,
+        loader,
+        mu,
+        std,
+        tag="Val-Knockout",
+        device=device,
+        cfg={"verbose": False},
+    )
+    mse_real = float(mse_real)
+    return float(math.sqrt(mse_real)) if mse_real > 0 else 0.0
 
 
 # =======================================================
@@ -256,6 +289,57 @@ def update_w1_forest_summary_and_detail(results_w1_csv: str | Path, out_dir: str
     )
 
 
+def compute_and_save_w1_knockout_curve(
+    ctx: Dict[str, Any],
+    model,
+    loader,
+    mu,
+    std,
+    device,
+    out_dir: Path,
+) -> Dict[str, Any]:
+    out_dir = Path(out_dir)
+    summary_csv = out_dir / "knockout_curve_summary.csv"
+    detail_csv = out_dir / "knockout_curve_detail.csv"
+
+    base_rmse = _evaluate_rmse(model, loader, mu, std, device)
+    deltas = []
+    detail_rows = []
+
+    depth = len(getattr(model, "xhconv_blks", []))
+    for idx in range(depth):
+        with _disable_cross_at(model, idx):
+            rmse_i = _evaluate_rmse(model, loader, mu, std, device)
+        delta = rmse_i - base_rmse
+        deltas.append(delta)
+        detail_rows.append({
+            **{k: ctx.get(k) for k in REQUIRED_KEYS if k in ctx},
+            "layer_idx": idx,
+            "rmse_knockout": rmse_i,
+            "delta_rmse": delta,
+        })
+
+    append_or_update_long(detail_csv, detail_rows, subset_keys=REQUIRED_KEYS + ["layer_idx"])
+
+    if deltas:
+        delta_array = np.array(deltas, dtype=float)
+        delta_mean = float(delta_array.mean())
+        delta_max = float(delta_array.max())
+        delta_min = float(delta_array.min())
+    else:
+        delta_mean = delta_max = delta_min = np.nan
+
+    summary_row = {
+        **{k: ctx.get(k) for k in REQUIRED_KEYS if k in ctx},
+        "w1_knockout_base_rmse": base_rmse,
+        "w1_knockout_delta_mean": delta_mean,
+        "w1_knockout_delta_max": delta_max,
+        "w1_knockout_delta_min": delta_min,
+    }
+    append_or_update_row(summary_csv, summary_row, subset_keys=REQUIRED_KEYS)
+    return summary_row
+
+
 # =======================================================
 # (D) 번들 호출 (한 번에 W1 3종 저장)
 # =======================================================
@@ -268,6 +352,12 @@ def save_w1_figures_bundle(
     results_out_root: str | Path = "results_W1",
     cka_metrics: Optional[Dict[str, Any]] = None,
     grad_metrics: Optional[Dict[str, Any]] = None,
+    *,
+    model=None,
+    val_loader=None,
+    mu=None,
+    std=None,
+    device=None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     한 번의 평가(run)에서 W1 그림 3종을 한꺼번에 저장.
@@ -317,4 +407,24 @@ def save_w1_figures_bundle(
             out_dir=Path(results_out_root)/dataset/"forest_plot"
         )
         summary.setdefault("forest", {})
+
+    # 4) Knock-out curve
+    if (
+        model is not None
+        and val_loader is not None
+        and mu is not None
+        and std is not None
+        and device is not None
+    ):
+        row = compute_and_save_w1_knockout_curve(
+            ctx={**base_ctx, "plot_type": "knockout_curve"},
+            model=model,
+            loader=val_loader,
+            mu=mu,
+            std=std,
+            device=device,
+            out_dir=Path(results_out_root)/dataset/"knockout_curve",
+        )
+        summary["knockout"] = row
+
     return summary

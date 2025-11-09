@@ -94,27 +94,6 @@ class W1Experiment(BaseExperiment):
             h2 = gru_blks[last_idx].register_forward_hook(make_repr_hook(gru_repr_list))
             hooks.extend([h1, h2])
         
-        # 층별 손실 수집을 위한 준비
-        layerwise_outputs = []  # [(layer_idx, output_tensor)]
-        
-        def make_layerwise_hook(layer_idx, outputs_list):
-            def hook_fn(module, input, output):
-                # 교차 블록 출력 저장 (zc, zr 중 하나)
-                if isinstance(output, tuple) and len(output) == 2:
-                    # (zc, zr) 튜플인 경우 첫 번째 것만
-                    out_tensor = output[0]
-                else:
-                    out_tensor = output
-                
-                outputs_list.append((layer_idx, out_tensor.detach()))
-            return hook_fn
-        
-        # 교차 블록에 층별 출력 수집 후크 등록
-        if has_direct_blocks and hasattr(self.model, 'xhconv_blks'):
-            for i, xhconv_blk in enumerate(self.model.xhconv_blks):
-                h = xhconv_blk.register_forward_hook(make_layerwise_hook(i, layerwise_outputs))
-                hooks.append(h)
-        
         # 그래디언트 수집을 위한 텐서 (forward 시 저장)
         cnn_grad_tensor = None
         gru_grad_tensor = None
@@ -133,19 +112,6 @@ class W1Experiment(BaseExperiment):
                 gru_repr_concat = np.concatenate(gru_repr_list, axis=0)  # (N_total, d)
                 hooks_data["cnn_representations"] = [cnn_repr_concat]
                 hooks_data["gru_representations"] = [gru_repr_concat]
-            
-            # 층별 손실 계산 (간소화: 여기서는 더미 값 사용, 실제로는 각 층 출력으로 예측 후 손실 계산 필요)
-            # 실제 구현: 각 층 출력을 모델의 나머지 부분에 통과시켜 예측 후 손실 계산
-            # 여기서는 간단히 검증 손실의 근사치로 대체
-            if layerwise_outputs:
-                # 실제로는 복잡하므로, 평가 손실을 층 개수로 나눠 근사
-                # 더 정확한 구현은 각 층별로 forward를 수행해야 함
-                num_layers = len(self.model.xhconv_blks) if hasattr(self.model, 'xhconv_blks') else 1
-                base_loss = direct.get('mse_real', 1.0)
-                # 층이 진행될수록 손실이 감소한다고 가정
-                layerwise_losses = [base_loss * (1.0 - 0.1 * i / max(1, num_layers - 1)) 
-                                  for i in range(num_layers)]
-                hooks_data["layerwise_losses"] = layerwise_losses
             
         finally:
             # 훅 제거
@@ -223,6 +189,11 @@ class W1Experiment(BaseExperiment):
             results_out_root=self.out_root / f"results_{self.experiment_type}",
             cka_metrics=cka_metrics,
             grad_metrics=grad_metrics,
+            model=self.model,
+            val_loader=self.val_loader,
+            mu=self.mu,
+            std=self.std,
+            device=self.device,
         )
 
         cka_keys = ["cka_s", "cka_m", "cka_d", "cka_diag_mean", "cka_full_mean"]
@@ -235,11 +206,21 @@ class W1Experiment(BaseExperiment):
         for key in grad_keys:
             direct[key] = grad_row.get(key, np.nan) if grad_row else np.nan
 
+        knockout_keys = [
+            "w1_knockout_base_rmse",
+            "w1_knockout_delta_mean",
+            "w1_knockout_delta_max",
+            "w1_knockout_delta_min",
+        ]
+        knockout_row = summary_rows.get("knockout")
+        for key in knockout_keys:
+            direct[key] = knockout_row.get(key, np.nan) if knockout_row else np.nan
+
         self._w1_plot_payload = {
-            "feature_dict": feature_dict,
-            "grad_dict": grad_dict,
-            "cka_metrics": cka_metrics,
-            "grad_metrics": grad_metrics,
+            "feature_dict": None,
+            "grad_dict": None,
+            "cka_metrics": None,
+            "grad_metrics": None,
         }
         return direct
 
