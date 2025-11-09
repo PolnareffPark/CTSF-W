@@ -373,3 +373,109 @@ def build_forest_from_results(
 
     detail = pd.DataFrame(rows)
     _atomic_write_csv(detail, detail_csv)
+
+# ============================================================
+# (Append) W2 계산 유틸 (게이트 실측치로부터 완전 계산)
+# ============================================================
+from typing import Iterable, Optional, Dict, Any, Tuple
+import numpy as np
+
+def _np(x):
+    return np.asarray(x, dtype=float)
+
+def _to_numpy_1d_time(x: np.ndarray) -> np.ndarray:
+    """
+    임의 차원 (N, T, C) / (T, C) / (T,) 등에서 시간축 T만 남겨 1D로 평균 축소.
+    시간축은 마지막에서 두번째 차원(-2)로 가정.
+    """
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 1:
+        return arr
+    T = arr.shape[-2] if arr.ndim >= 2 else arr.shape[0]
+    axes = tuple(i for i in range(arr.ndim) if i != arr.ndim-2)
+    if axes:
+        arr = np.nanmean(arr, axis=axes)
+    return arr
+
+def infer_tod_bins_by_dataset(dataset: str) -> int:
+    ds = (dataset or "").lower()
+    if "ettm" in ds: return 96
+    return 24  # ETTh, weather 등 기본 24
+
+def make_tod_labels(T: int, explicit: Optional[Iterable[int]] = None) -> np.ndarray:
+    if explicit is not None:
+        lab = np.array(list(explicit), dtype=int)
+        if lab.size == T: return lab
+    return np.arange(T, dtype=int)
+
+def compute_w2_gate_tod_means_from_raw(
+    gates_by_stage: Dict[str, np.ndarray],  # {"S": arr, "M": arr, "D": arr}
+    dataset: str,
+    tod_labels: Optional[Iterable[int]] = None
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for stage_key, alias in [("S","s"),("M","m"),("D","d")]:
+        arr = gates_by_stage.get(stage_key) or gates_by_stage.get(stage_key.lower())
+        if arr is None: 
+            continue
+        t1d = _to_numpy_1d_time(np.asarray(arr))
+        out[f"gate_tod_mean_{alias}"] = [float(v) if np.isfinite(v) else np.nan for v in t1d]
+    T = max((
+        len(out.get("gate_tod_mean_s",[])),
+        len(out.get("gate_tod_mean_m",[])),
+        len(out.get("gate_tod_mean_d",[]))
+    ), default=0)
+    out["tod_labels"] = list(make_tod_labels(T, tod_labels))
+    return out
+
+def compute_w2_gate_distribution_stats_from_raw(
+    gates_all: np.ndarray,
+    sparsity_thr: float = 1e-3,
+    return_channel_stats: bool = False
+) -> Dict[str, Any]:
+    x = np.asarray(gates_all, dtype=float).ravel()
+    total = x.size
+    x = x[np.isfinite(x)]
+    valid = x.size
+    if valid == 0:
+        return {"gate_valid_ratio": 0.0, "gate_nan_count": int(total)}
+    mean = float(np.mean(x)); std = float(np.std(x))
+    if np.allclose(np.max(x), np.min(x)):
+        entropy = 0.0
+    else:
+        hist, _ = np.histogram(x, bins=50, range=(float(np.min(x)), float(np.max(x))), density=True)
+        hist = hist[hist>0]
+        entropy = float(-np.sum(hist*np.log(hist)) * (1.0/50.0))
+    kurt = float(np.mean(((x-mean)/(std+1e-12))**4) - 3.0) if valid>0 else 0.0
+    sparsity = float(np.mean(np.abs(x) < sparsity_thr))
+    qs = np.quantile(x, [0.05,0.10,0.25,0.50,0.75,0.90,0.95])
+    out = {
+        "gate_mean": mean, "gate_std": std, "gate_entropy": entropy,
+        "gate_kurtosis": kurt, "gate_sparsity": sparsity,
+        "gate_q05": float(qs[0]), "gate_q10": float(qs[1]), "gate_q25": float(qs[2]),
+        "gate_q50": float(qs[3]), "gate_q75": float(qs[4]), "gate_q90": float(qs[5]), "gate_q95": float(qs[6]),
+        "gate_valid_ratio": float(valid)/float(total) if total>0 else np.nan,
+        "gate_nan_count": int(total - valid),
+    }
+    if return_channel_stats:
+        out["gate_channel_stats"] = []
+    return out
+
+def compute_w2_time_variability(gates_time_major: np.ndarray) -> float:
+    arr = np.asarray(gates_time_major, dtype=float)
+    if arr.ndim == 1: 
+        return float(np.std(arr))
+    std_t = np.nanstd(arr, axis=-2)  # 시간축 std
+    return float(np.nanmean(std_t))
+
+def package_w2_gate_metrics(
+    gates_by_stage: Dict[str, np.ndarray],
+    gates_all: np.ndarray,
+    dataset: str,
+    tod_labels: Optional[Iterable[int]] = None
+) -> Dict[str, Any]:
+    tod = compute_w2_gate_tod_means_from_raw(gates_by_stage, dataset=dataset, tod_labels=tod_labels)
+    dist = compute_w2_gate_distribution_stats_from_raw(gates_all, sparsity_thr=1e-3)
+    varT = compute_w2_time_variability(gates_all)
+    dist["w2_gate_variability_time"] = float(varT)
+    return {**tod, **dist}
