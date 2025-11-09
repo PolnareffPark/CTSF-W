@@ -13,54 +13,142 @@ CTSF 모델의 Ablation Study를 위한 모듈화된 코드베이스입니다.
 
 ```
 .
-├── CHANGES_SUMMARY.md
 ├── config/
 │   └── config.py
-├── CTSF-W-Overview.md
 ├── data/
 │   ├── __init__.py
 │   └── dataset.py
 ├── datasets/
+│   ├── ETTh1.csv
+│   ├── ETTh2.csv
+│   ├── ETTm1.csv
+│   ├── ETTm2.csv
+│   └── weather.csv
 ├── docs/
 │   ├── exp-plan/
 │   ├── experiment_modifications/
 │   ├── original-code/
 │   └── Papers/
-├── environment-check.ipynb
 ├── experiments/
+│   ├── __init__.py
 │   ├── base_experiment.py
 │   ├── w1_experiment.py
 │   ├── w2_experiment.py
 │   ├── w3_experiment.py
 │   ├── w4_experiment.py
 │   └── w5_experiment.py
-├── hp2_config.yaml
-├── main.py
 ├── models/
 │   ├── ctsf_model.py
 │   └── experiment_variants.py
 ├── results/
+│   ├── results_W1/
+│   │   ├── ETTh1/
+│   │   │   ├── cka_heatmap/
+│   │   │   │   ├── cka_heatmap_detail.csv
+│   │   │   │   └── cka_heatmap_summary.csv
+│   │   │   ├── forest_plot/
+│   │   │   │   ├── forest_plot_detail.csv
+│   │   │   │   └── forest_plot_summary.csv
+│   │   │   ├── grad_align_bar/
+│   │   │   │   ├── grad_align_bar_detail.csv
+│   │   │   │   └── grad_align_bar_summary.csv
+│   │   │   └── knockout_curve/
+│   │   │       ├── knockout_curve_detail.csv
+│   │   │       └── knockout_curve_summary.csv
+│   │   ├── ETTh2/
+│   │   │   ├── cka_heatmap/
+│   │   │   │   ├── cka_heatmap_detail.csv
+│   │   │   │   └── cka_heatmap_summary.csv
+│   │   │   ├── forest_plot/
+│   │   │   │   ├── forest_plot_detail.csv
+│   │   │   │   └── forest_plot_summary.csv
+│   │   │   ├── grad_align_bar/
+│   │   │   │   ├── grad_align_bar_detail.csv
+│   │   │   │   └── grad_align_bar_summary.csv
+│   │   │   └── knockout_curve/
+│   │   │       ├── knockout_curve_detail.csv
+│   │   │       └── knockout_curve_summary.csv
+│   │   ├── ETTm1/
+│   │   │   ├── cka_heatmap/
+│   │   │   │   ├── cka_heatmap_detail.csv
+│   │   │   │   └── cka_heatmap_summary.csv
+│   │   │   ├── forest_plot/
+│   │   │   │   ├── forest_plot_detail.csv
+│   │   │   │   └── forest_plot_summary.csv
+│   │   │   ├── grad_align_bar/
+│   │   │   │   ├── grad_align_bar_detail.csv
+│   │   │   │   └── grad_align_bar_summary.csv
+│   │   │   └── knockout_curve/
+│   │   │       ├── knockout_curve_detail.csv
+│   │   │       └── knockout_curve_summary.csv
+│   │   ├── ETTm2/
+│   │   │   ├── cka_heatmap/
+│   │   │   │   ├── cka_heatmap_detail.csv
+│   │   │   │   └── cka_heatmap_summary.csv
+│   │   │   ├── forest_plot/
+│   │   │   │   ├── forest_plot_detail.csv
+│   │   │   │   └── forest_plot_summary.csv
+│   │   │   ├── grad_align_bar/
+│   │   │   │   ├── grad_align_bar_detail.csv
+│   │   │   │   └── grad_align_bar_summary.csv
+│   │   │   └── knockout_curve/
+│   │   │       ├── knockout_curve_detail.csv
+│   │   │       └── knockout_curve_summary.csv
+│   │   └── weather/
+│   │       ├── cka_heatmap/
+│   │       │   ├── cka_heatmap_detail.csv
+│   │       │   └── cka_heatmap_summary.csv
+│   │       ├── forest_plot/
+│   │       │   ├── forest_plot_detail.csv
+│   │       │   └── forest_plot_summary.csv
+│   │       ├── grad_align_bar/
+│   │       │   ├── grad_align_bar_detail.csv
+│   │       │   └── grad_align_bar_summary.csv
+│   │       └── knockout_curve/
+│   │           ├── knockout_curve_detail.csv
+│   │           └── knockout_curve_summary.csv
+│   └── results_W1.csv
 ├── results_test/
+│   ├── results_W1/
+│   ├── results_W2/
+│   ├── results_W3/
+│   ├── results_W4/
+│   └── results_W5/
+├── utils/
+│   ├── experiment_metrics/
+│   │   ├── __init__.py
+│   │   ├── all_metrics.py
+│   │   ├── w1_metrics.py
+│   │   ├── w2_metrics.py
+│   │   ├── w3_metrics.py
+│   │   ├── w4_metrics.py
+│   │   └── w5_metrics.py
+│   ├── experiment_plotting_metrics/
+│   │   ├── all_plotting_metrics.py
+│   │   ├── w1_plotting_metrics.py
+│   │   ├── w2_plotting_metrics.py
+│   │   ├── w3_plotting_metrics.py
+│   │   ├── w4_plotting_metrics.py
+│   │   └── w5_plotting_metrics.py
+│   ├── __init__.py
+│   ├── csv_logger.py
+│   ├── direct_evidence.py
+│   ├── error_logger.py
+│   ├── hooks.py
+│   ├── metrics.py
+│   └── training.py
+├── CHANGES_SUMMARY.md
+├── CTSF-W-Overview.md
+├── README.md
+├── env_package_list.txt
+├── environment-check.ipynb
+├── hp2_config.yaml
+├── main.py
+├── req_no_torch.txt
 ├── run_all_experiments.py
 ├── run_suite.py
 ├── test_single_experiments.py
-├── test_w3_feedback_fixes.py
-└── utils/
-    ├── csv_logger.py
-    ├── direct_evidence.py
-    ├── error_logger.py
-    ├── experiment_metrics/
-    │   ├── all_metrics.py
-    │   ├── w1_metrics.py
-    │   ├── w2_metrics.py
-    │   ├── w3_metrics.py
-    │   ├── w4_metrics.py
-    │   └── w5_metrics.py
-    ├── hooks.py
-    ├── metrics.py
-    ├── plot_results.py
-    ├── plotting_metrics.py
-    └── training.py
+└── test_w3_feedback_fixes.py
 ```
 
 ## 실험 개요
