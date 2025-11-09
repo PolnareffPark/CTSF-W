@@ -25,6 +25,7 @@ class BaseExperiment:
         self.out_dir = self.out_root / self.dataset_tag
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.experiment_type = cfg.get("experiment_type", "W1")
+        self._plotting_payload = {}
         self.start_time = None
         self.train_time = None
         self.active_layers = None  # W4 실험에서 사용
@@ -249,34 +250,37 @@ class BaseExperiment:
             # 실험별 특화 지표 모듈이 없으면 스킵
             pass
         
-        # 보고용 그림 지표 계산
-        # 주의: 그림 지표 계산은 선택적이며, 실패해도 기본 평가는 계속 진행
-        # 이유: CKA, 그래디언트 정렬 등은 추가 계산이 필요하고 메모리/시간 부담이 있을 수 있음
-        from utils.plotting_metrics import compute_all_plotting_metrics
-        
-        # 작은 배치만 사용하여 계산 부담 최소화
-        small_loader = torch.utils.data.DataLoader(
-            self.test_loader.dataset,
-            batch_size=min(16, self.cfg.get("batch_size", 128)),
-            shuffle=False,
-            num_workers=0
-        )
-        
-        plotting_metrics = compute_all_plotting_metrics(
-            model=self.model,
-            loader=small_loader,
-            mu=self.mu,
-            std=self.std,
-            tod_vec=tod_vec,
-            device=self.device,
-            experiment_type=self.experiment_type,
-            hooks_data=hooks_data,
-            compute_grad_align=self.cfg.get("compute_grad_align", False)
-        )
-        
-        # 지표 통합
-        for k, v in plotting_metrics.items():
+        # 보고용 그림 지표 계산 (실험별 모듈에 위임)
+        plotting_metrics = {}
+        if self.experiment_type != "W1":
+            small_loader = torch.utils.data.DataLoader(
+                self.test_loader.dataset,
+                batch_size=min(16, self.cfg.get("batch_size", 128)),
+                shuffle=False,
+                num_workers=0
+            )
+            try:
+                from importlib import import_module
+                module = import_module(
+                    f"utils.experiment_plotting_metrics.{self.experiment_type.lower()}_plotting_metrics"
+                )
+                compute_fn = getattr(module, "compute_experiment_plotting_metrics", None)
+                if callable(compute_fn):
+                    plotting_metrics = compute_fn(
+                        model=self.model,
+                        loader=small_loader,
+                        mu=self.mu,
+                        std=self.std,
+                        tod_vec=tod_vec,
+                        device=self.device,
+                        hooks_data=hooks_data,
+                        cfg=self.cfg,
+                    ) or {}
+            except ImportError:
+                plotting_metrics = {}
+        for k, v in (plotting_metrics or {}).items():
             direct[k] = v
+        self._plotting_payload = plotting_metrics
         
         return direct
     
@@ -297,37 +301,26 @@ class BaseExperiment:
         if self.cfg.get("verbose", True):
             print(f"[saved] {fpath}")
         
-        # 보고용 그림 데이터 저장
-        # 주의: 그림 데이터만 저장하며, 실제 그림 그리기 코드는 포함되지 않음
-        # 그림은 별도 스크립트로 CSV 데이터를 읽어서 그려야 함
-        from utils.plot_results import save_plot_data
-        
-        # 그림 타입별로 데이터 저장
-        plot_types = {
-            "W2": ["forest_plot", "gate_tod_heatmap", "gate_distribution"],
-            "W3": ["effect_size_bar", "rank_preservation", "lag_distribution"],
-            "W4": ["rmse_line", "gate_usage_bar", "cka_heatmap"],
-            "W5": ["degradation_bar", "gate_distribution"],
-        }
-        
-        for plot_type in plot_types.get(self.experiment_type, []):
-            # 해당 그림 타입에 필요한 데이터만 추출
-            plot_data = {k: v for k, v in direct_metrics.items() 
-                        if k.startswith(plot_type.split('_')[0]) or 
-                        k in ['rmse', 'mse_real', 'mae'] or
-                        'cka' in k or 'grad_align' in k or 'gate' in k or 'bestlag' in k}
-            
-            if plot_data:
-                save_plot_data(
-                    experiment_type=self.experiment_type,
+        try:
+            from importlib import import_module
+
+            module = import_module(
+                f"utils.experiment_plotting_metrics.{self.experiment_type.lower()}_plotting_metrics"
+            )
+            save_bundle = getattr(module, "save_experiment_figures_bundle", None)
+            if callable(save_bundle):
+                payload = getattr(self, "_plotting_payload", {}) or {}
+                save_bundle(
                     dataset=self.dataset_tag,
-                    plot_type=plot_type,
-                    plot_data=plot_data,
-                    horizon=int(self.cfg.get("horizon", 0)),
-                    seed=int(self.cfg.get("seed", 0)),
+                    horizon=self.cfg["horizon"],
+                    seed=self.cfg["seed"],
                     mode=self.cfg.get("mode", "default"),
-                    results_root=str(self.out_root)
+                    results_csv=fpath,
+                    results_out_root=self.out_root / f"results_{self.experiment_type}",
+                    **payload,
                 )
+        except ImportError:
+            pass
         
         return fpath
     

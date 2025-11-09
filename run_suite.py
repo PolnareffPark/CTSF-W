@@ -161,12 +161,6 @@ def run_experiment_suite(
     # 계획 출력
     print(f"[plan] experiment={experiment_type} | mode={resume_mode} | overwrite={overwrite}")
     print(f"[plan] grid={len(grid_keys)} | done={len(done_set)} | to_run={len(plan)} | last={last_key}")
-    if plan:
-        preview = ", ".join([str(plan[i]) for i in range(min(6, len(plan)))])
-        print(f"[plan] first up to 6: {preview}")
-    else:
-        print("[plan] nothing to run.")
-        return
     
     if dry_run:
         print("[dry_run] 계획만 출력하고 종료합니다.")

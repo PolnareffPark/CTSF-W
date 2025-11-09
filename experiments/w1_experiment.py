@@ -3,6 +3,7 @@ W1 실험: 층별 교차 vs. 최종 결합 (Late Fusion)
 """
 
 from pathlib import Path
+from typing import Any, Dict
 import torch
 import numpy as np
 from experiments.base_experiment import BaseExperiment
@@ -10,12 +11,11 @@ from models.ctsf_model import HybridTS
 from models.experiment_variants import LastLayerFusionModel
 from utils.direct_evidence import evaluate_with_direct_evidence
 from data.dataset import build_test_tod_vector
-from utils.plotting_metrics import compute_layerwise_cka, compute_gradient_alignment
-from utils.experiment_plotting_metrics.w1_plotting_metrics import (
-    save_w1_cka_heatmap,
-    save_w1_grad_align_bar,
-    update_w1_forest_summary_from_results,
+from utils.experiment_plotting_metrics.all_plotting_metrics import (
+    compute_layerwise_cka,
+    compute_gradient_alignment,
 )
+from utils.experiment_plotting_metrics.w1_plotting_metrics import save_w1_figures_bundle
 
 
 class W1Experiment(BaseExperiment):
@@ -46,7 +46,7 @@ class W1Experiment(BaseExperiment):
         
         # W1 특화: CNN/GRU 표현, 층별 손실, 그래디언트 수집
         hooks_data = {}
-        self._w1_plot_metrics = {}
+        self._w1_plot_payload = {}
         hooks = []
         
         # 마지막 층의 CNN/GRU 표현 수집
@@ -119,13 +119,6 @@ class W1Experiment(BaseExperiment):
         cnn_grad_tensor = None
         gru_grad_tensor = None
 
-        small_loader = torch.utils.data.DataLoader(
-            self.test_loader.dataset,
-            batch_size=min(16, self.cfg.get("batch_size", 128)),
-            shuffle=False,
-            num_workers=0
-        )
-        
         try:
             # 기본 평가 수행 (표현 수집)
             direct = evaluate_with_direct_evidence(
@@ -154,60 +147,44 @@ class W1Experiment(BaseExperiment):
                                   for i in range(num_layers)]
                 hooks_data["layerwise_losses"] = layerwise_losses
             
-            # 그래디언트 수집: 작은 배치로 역전파 수행
-            
-            # 그래디언트 계산을 위해 일시적으로 train 모드 전환
-            original_mode = self.model.training
-            self.model.train()  # RNN backward를 위해 train 모드 필요
-            
-            try:
-                # 한 배치로 그래디언트 계산
-                for xb, yb in small_loader:
-                    xb, yb = xb.to(self.device), yb.to(self.device)
-                    xb.requires_grad_(True)
-                    
-                    # Forward with gradient tracking
-                    self.model.zero_grad()
-                    pred = self.model(xb)
-                    
-                    # 손실 계산
-                    loss = torch.nn.functional.mse_loss(pred, yb)
-                    
-                    # Backward
-                    loss.backward()
-                    
-                    # 각 경로의 첫 파라미터 그래디언트 수집 (대표값)
-                    if has_direct_blocks:
-                        # CNN 경로 그래디언트
-                        for name, param in self.model.named_parameters():
-                            if 'conv_blks' in name and param.grad is not None:
-                                cnn_grad_tensor = param.grad.detach().cpu().numpy().flatten()
-                                break
-                        
-                        # GRU 경로 그래디언트
-                        for name, param in self.model.named_parameters():
-                            if 'gru_blks' in name and param.grad is not None:
-                                gru_grad_tensor = param.grad.detach().cpu().numpy().flatten()
-                                break
-                    
-                    # 첫 배치만 사용
-                    break
-            finally:
-                # 원래 모드로 복원
-                if not original_mode:
-                    self.model.eval()
-            
-            if cnn_grad_tensor is not None and gru_grad_tensor is not None:
-                # 두 그래디언트의 크기를 맞춤 (작은 쪽에 맞춤)
-                min_len = min(len(cnn_grad_tensor), len(gru_grad_tensor))
-                hooks_data["cnn_gradients"] = cnn_grad_tensor[:min_len]
-                hooks_data["gru_gradients"] = gru_grad_tensor[:min_len]
-            
         finally:
             # 훅 제거
             for h in hooks:
                 h.remove()
         
+        if "compute_grad_align" not in self.cfg:
+            self.cfg["compute_grad_align"] = True
+
+        plot_loader = torch.utils.data.DataLoader(
+            self.test_loader.dataset,
+            batch_size=min(16, self.cfg.get("batch_size", 128)),
+            shuffle=False,
+            num_workers=0
+        )
+
+        feature_dict = self._collect_layerwise_features(plot_loader, max_batches=2) if has_direct_blocks else None
+        grad_dict = None
+        grad_metrics = None
+        if has_direct_blocks and self.cfg.get("compute_grad_align", False):
+            grad_dict = self._collect_layerwise_gradients(plot_loader, max_batches=1)
+            if grad_dict:
+                try:
+                    grad_metrics = compute_gradient_alignment(grad_dict=grad_dict)
+                except Exception:
+                    grad_metrics = None
+            if grad_dict:
+                cnn_global = []
+                gru_global = []
+                for arr in grad_dict.get("cnn", []):
+                    if isinstance(arr, np.ndarray) and arr.size > 0:
+                        cnn_global.append(arr.mean(axis=0))
+                for arr in grad_dict.get("gru", []):
+                    if isinstance(arr, np.ndarray) and arr.size > 0:
+                        gru_global.append(arr.mean(axis=0))
+                if cnn_global and gru_global:
+                    hooks_data["cnn_gradients"] = np.concatenate(cnn_global).ravel()
+                    hooks_data["gru_gradients"] = np.concatenate(gru_global).ravel()
+
         # 실험별 특화 지표 계산
         try:
             from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
@@ -228,76 +205,185 @@ class W1Experiment(BaseExperiment):
         except ImportError:
             pass
         
-        # W1 전용 그림 지표 계산 및 저장 준비
-        cka_metrics = compute_layerwise_cka(
-            model=self.model,
-            loader=small_loader,
-            device=self.device,
-            n_samples=256,
+        cka_metrics = None
+        if feature_dict:
+            try:
+                cka_metrics = compute_layerwise_cka(feature_dict=feature_dict)
+            except Exception:
+                cka_metrics = None
+
+        summary_rows = save_w1_figures_bundle(
+            dataset=self.dataset_tag,
+            horizon=self.cfg["horizon"],
+            seed=self.cfg["seed"],
+            mode=self.cfg.get("mode", "default"),
+            feature_dict=feature_dict,
+            grad_dict=grad_dict,
+            results_w1_csv=None,
+            results_out_root=self.out_root / f"results_{self.experiment_type}",
+            cka_metrics=cka_metrics,
+            grad_metrics=grad_metrics,
         )
 
-        if cka_metrics:
-            self._w1_plot_metrics["cka"] = cka_metrics
-            for key in ["cka_s", "cka_m", "cka_d", "cka_diag_mean", "cka_full_mean"]:
-                if key in cka_metrics:
-                    val = cka_metrics[key]
-                    direct[key] = float(val) if isinstance(val, (np.floating, float)) else val
-        else:
-            self._w1_plot_metrics["cka"] = {}
+        cka_keys = ["cka_s", "cka_m", "cka_d", "cka_diag_mean", "cka_full_mean"]
+        cka_row = summary_rows.get("cka")
+        for key in cka_keys:
+            direct[key] = cka_row.get(key, np.nan) if cka_row else np.nan
 
-        if self.cfg.get("compute_grad_align", False):
-            grad_metrics = compute_gradient_alignment(
-                model=self.model,
-                loader=small_loader,
-                mu=self.mu,
-                std=self.std,
-                device=self.device,
-            )
-            self._w1_plot_metrics["grad"] = grad_metrics
-            for key in ["grad_align_s", "grad_align_m", "grad_align_d", "grad_align_mean"]:
-                if key in grad_metrics:
-                    val = grad_metrics[key]
-                    direct[key] = float(val) if isinstance(val, (np.floating, float)) else val
-        else:
-            self._w1_plot_metrics["grad"] = {}
+        grad_keys = ["grad_align_s", "grad_align_m", "grad_align_d", "grad_align_mean"]
+        grad_row = summary_rows.get("grad")
+        for key in grad_keys:
+            direct[key] = grad_row.get(key, np.nan) if grad_row else np.nan
 
+        self._w1_plot_payload = {
+            "feature_dict": feature_dict,
+            "grad_dict": grad_dict,
+            "cka_metrics": cka_metrics,
+            "grad_metrics": grad_metrics,
+        }
         return direct
 
     def save_results(self, direct_metrics):
         fpath = super().save_results(direct_metrics)
-        plot_root = Path(self.out_root) / f"results_{self.experiment_type}" / self.dataset_tag
-        ctx_base = {
-            "experiment_type": self.experiment_type,
-            "dataset": self.dataset_tag,
-            "horizon": int(self.cfg["horizon"]),
-            "seed": int(self.cfg["seed"]),
-            "mode": self.cfg.get("mode", "default"),
-        }
-
-        cka_metrics = self._w1_plot_metrics.get("cka", {})
-        if cka_metrics and cka_metrics.get("cka_matrix") is not None:
-            ctx = {**ctx_base, "plot_type": "cka_heatmap"}
-            save_w1_cka_heatmap(ctx, cka_metrics, out_dir=plot_root / "cka_heatmap")
-
-        grad_metrics = self._w1_plot_metrics.get("grad", {})
-
-        def _has_finite_grad(values):
-            for key in values:
-                val = grad_metrics.get(key)
-                if isinstance(val, (float, np.floating)) and np.isfinite(val):
-                    return True
-            return False
-
-        if grad_metrics and (
-            grad_metrics.get("grad_align_by_layer")
-            or _has_finite_grad(["grad_align_s", "grad_align_m", "grad_align_d"])
-        ):
-            ctx = {**ctx_base, "plot_type": "grad_align_bar"}
-            save_w1_grad_align_bar(ctx, grad_metrics, out_dir=plot_root / "grad_align_bar")
-
-        update_w1_forest_summary_from_results(
-            results_w1_csv=Path(fpath),
-            out_csv=plot_root / "forest_plot" / "forest_plot_summary.csv",
-        )
-
+        payload = getattr(self, "_w1_plot_payload", None)
+        if payload:
+            save_w1_figures_bundle(
+                dataset=self.dataset_tag,
+                horizon=self.cfg["horizon"],
+                seed=self.cfg["seed"],
+                mode=self.cfg.get("mode", "default"),
+                feature_dict=payload.get("feature_dict"),
+                grad_dict=payload.get("grad_dict"),
+                results_w1_csv=fpath,
+                results_out_root=self.out_root / f"results_{self.experiment_type}",
+                cka_metrics=payload.get("cka_metrics"),
+                grad_metrics=payload.get("grad_metrics"),
+            )
         return fpath
+
+    def _collect_layerwise_features(self, loader, max_batches: int = 2):
+        depth = len(getattr(self.model, "conv_blks", []))
+        if depth == 0:
+            return None
+
+        storage_cnn = [[] for _ in range(depth)]
+        storage_gru = [[] for _ in range(depth)]
+
+        def make_feature_hook(storage, idx):
+            def hook(module, inputs, output):
+                tensor = output[0] if isinstance(output, tuple) else output
+                if tensor is None:
+                    return
+                tensor = tensor.detach().permute(1, 0, 2).reshape(tensor.size(1), -1).cpu().numpy()
+                storage[idx].append(tensor)
+            return hook
+
+        handles = []
+        model = self.model
+        device = self.device
+        original_mode = model.training
+        model.eval()
+        try:
+            for idx in range(depth):
+                handles.append(model.conv_blks[idx].register_forward_hook(make_feature_hook(storage_cnn, idx)))
+                handles.append(model.gru_blks[idx].register_forward_hook(make_feature_hook(storage_gru, idx)))
+            with torch.no_grad():
+                for batch_idx, (xb, _) in enumerate(loader):
+                    if batch_idx >= max_batches:
+                        break
+                    xb = xb.to(device)
+                    model(xb)
+        finally:
+            for h in handles:
+                h.remove()
+            if original_mode:
+                model.train()
+
+        feature_dict = {"cnn": [], "gru": []}
+        any_data = False
+        max_rows = 2000
+        for lists in storage_cnn:
+            if lists:
+                arr = np.concatenate(lists, axis=0)
+                if arr.shape[0] > max_rows:
+                    arr = arr[:max_rows]
+                feature_dict["cnn"].append(arr.astype(np.float32, copy=False))
+                any_data = True
+            else:
+                feature_dict["cnn"].append(np.zeros((0, 1), dtype=np.float32))
+        for lists in storage_gru:
+            if lists:
+                arr = np.concatenate(lists, axis=0)
+                if arr.shape[0] > max_rows:
+                    arr = arr[:max_rows]
+                feature_dict["gru"].append(arr.astype(np.float32, copy=False))
+                any_data = True
+            else:
+                feature_dict["gru"].append(np.zeros((0, 1), dtype=np.float32))
+
+        return feature_dict if any_data else None
+
+    def _collect_layerwise_gradients(self, loader, max_batches: int = 1):
+        depth = len(getattr(self.model, "conv_blks", []))
+        if depth == 0:
+            return None
+
+        storage_cnn = [[] for _ in range(depth)]
+        storage_gru = [[] for _ in range(depth)]
+
+        def make_grad_hook(storage, idx):
+            def hook(module, grad_input, grad_output):
+                if not grad_output:
+                    return
+                tensor = grad_output[0]
+                if tensor is None:
+                    return
+                tensor = tensor.detach().permute(1, 0, 2).reshape(tensor.size(1), -1).cpu().numpy()
+                storage[idx].append(tensor)
+            return hook
+
+        handles = []
+        model = self.model
+        device = self.device
+        original_mode = model.training
+        model.train()
+        try:
+            for idx in range(depth):
+                handles.append(model.conv_blks[idx].register_full_backward_hook(make_grad_hook(storage_cnn, idx)))
+                handles.append(model.gru_blks[idx].register_full_backward_hook(make_grad_hook(storage_gru, idx)))
+            for batch_idx, (xb, yb) in enumerate(loader):
+                if batch_idx >= max_batches:
+                    break
+                xb = xb.to(device)
+                yb = yb.to(device)
+                model.zero_grad()
+                pred = model(xb)
+                loss = torch.nn.functional.mse_loss(pred, yb)
+                loss.backward()
+                break
+        finally:
+            for h in handles:
+                h.remove()
+            if original_mode:
+                model.train()
+            else:
+                model.eval()
+
+        grad_dict = {"cnn": [], "gru": []}
+        any_data = False
+        for lists in storage_cnn:
+            if lists:
+                arr = np.concatenate(lists, axis=0).astype(np.float32, copy=False)
+                grad_dict["cnn"].append(arr)
+                any_data = True
+            else:
+                grad_dict["cnn"].append(np.zeros((0, 1), dtype=np.float32))
+        for lists in storage_gru:
+            if lists:
+                arr = np.concatenate(lists, axis=0).astype(np.float32, copy=False)
+                grad_dict["gru"].append(arr)
+                any_data = True
+            else:
+                grad_dict["gru"].append(np.zeros((0, 1), dtype=np.float32))
+
+        return grad_dict if any_data else None

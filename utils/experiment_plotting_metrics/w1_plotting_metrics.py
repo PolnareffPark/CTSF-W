@@ -49,7 +49,7 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
 
@@ -87,7 +87,7 @@ def compute_and_save_w1_cka_heatmap(
     feature_dict: Dict[str, Any],
     out_dir: str | Path,
     depth_bins_cnn=None, depth_bins_gru=None, max_samples: Optional[int] = 20000
-) -> None:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """all_plotting_metrics의 compute_layerwise_cka를 실제 호출하여 저장까지 수행."""
     metrics = compute_layerwise_cka(
         feature_dict=feature_dict,
@@ -95,21 +95,22 @@ def compute_and_save_w1_cka_heatmap(
         max_samples=max_samples,
         depth_bins_cnn=depth_bins_cnn, depth_bins_gru=depth_bins_gru
     )
-    save_w1_cka_heatmap(ctx, metrics, out_dir)
+    summary_row = save_w1_cka_heatmap(ctx, metrics, out_dir)
+    return metrics, summary_row
 
-def save_w1_cka_heatmap(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir: str | Path) -> None:
+def save_w1_cka_heatmap(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     """이미 계산된 metrics(cka_matrix 등)를 받아 summary/detail을 저장."""
     out_dir = Path(out_dir)
     summary_csv = out_dir / "cka_heatmap_summary.csv"
     detail_csv  = out_dir / "cka_heatmap_detail.csv"
 
     if "cka_matrix" not in metrics:
-        return
+        return {}
 
     M = np.array(metrics["cka_matrix"], dtype=float)
     Lc, Lg = M.shape if M.ndim == 2 else (0, 0)
     if Lc == 0 or Lg == 0:
-        return
+        return {}
 
     cnn_bins = metrics.get("cnn_depth_bins") or _split_bins_auto(Lc)
     gru_bins = metrics.get("gru_depth_bins") or _split_bins_auto(Lg)
@@ -150,6 +151,7 @@ def save_w1_cka_heatmap(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir: s
                     "cka_value": round(float(v), 6)
                 })
     append_or_update_long(detail_csv, rows, subset_keys=REQUIRED_KEYS+["cnn_layer","gru_layer"])
+    return row
 
 
 # =======================================================
@@ -161,16 +163,17 @@ def compute_and_save_w1_grad_align_bar(
     grad_dict: Dict[str, Any],
     out_dir: str | Path,
     depth_bins=None
-) -> None:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """all_plotting_metrics의 compute_gradient_alignment를 실제 호출하여 저장까지 수행."""
     metrics = compute_gradient_alignment(
         grad_dict=grad_dict,
         cnn_key="cnn", gru_key="gru",
         depth_bins=depth_bins
     )
-    save_w1_grad_align_bar(ctx, metrics, out_dir)
+    summary_row = save_w1_grad_align_bar(ctx, metrics, out_dir)
+    return metrics, summary_row
 
-def save_w1_grad_align_bar(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir: str | Path) -> None:
+def save_w1_grad_align_bar(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     """이미 계산된 metrics(grad_align_by_layer 등)를 받아 summary/detail을 저장."""
     out_dir = Path(out_dir)
     summary_csv = out_dir / "grad_align_bar_summary.csv"
@@ -227,6 +230,7 @@ def save_w1_grad_align_bar(ctx: Dict[str, Any], metrics: Dict[str, Any], out_dir
         "grad_align_mean": all_mean if all_mean is not None else np.nan
     }
     append_or_update_row(summary_csv, row, subset_keys=REQUIRED_KEYS)
+    return row
 
 
 # =======================================================
@@ -261,8 +265,10 @@ def save_w1_figures_bundle(
     feature_dict: Optional[Dict[str, Any]] = None,      # CKA 계산용
     grad_dict: Optional[Dict[str, Any]] = None,         # Grad-Align 계산용
     results_w1_csv: Optional[str | Path] = None,
-    results_out_root: str | Path = "results_W1"
-) -> None:
+    results_out_root: str | Path = "results_W1",
+    cka_metrics: Optional[Dict[str, Any]] = None,
+    grad_metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
     """
     한 번의 평가(run)에서 W1 그림 3종을 한꺼번에 저장.
     - feature_dict 존재 시: CKA(summary/detail) 생성
@@ -277,21 +283,32 @@ def save_w1_figures_bundle(
         "mode": mode
     }
 
+    summary: Dict[str, Dict[str, Any]] = {}
     # 1) CKA
     if feature_dict is not None:
-        compute_and_save_w1_cka_heatmap(
-            ctx={**base_ctx, "plot_type": "cka_heatmap"},
+        metrics = cka_metrics or compute_layerwise_cka(
             feature_dict=feature_dict,
+            cnn_key="cnn", gru_key="gru"
+        )
+        row = save_w1_cka_heatmap(
+            ctx={**base_ctx, "plot_type": "cka_heatmap"},
+            metrics=metrics,
             out_dir=Path(results_out_root)/dataset/"cka_heatmap"
         )
+        summary["cka"] = row
 
     # 2) Grad-Align
     if grad_dict is not None:
-        compute_and_save_w1_grad_align_bar(
-            ctx={**base_ctx, "plot_type": "grad_align_bar"},
+        metrics = grad_metrics or compute_gradient_alignment(
             grad_dict=grad_dict,
+            cnn_key="cnn", gru_key="gru"
+        )
+        row = save_w1_grad_align_bar(
+            ctx={**base_ctx, "plot_type": "grad_align_bar"},
+            metrics=metrics,
             out_dir=Path(results_out_root)/dataset/"grad_align_bar"
         )
+        summary["grad"] = row
 
     # 3) Forest
     if results_w1_csv is not None:
@@ -299,3 +316,5 @@ def save_w1_figures_bundle(
             results_w1_csv=results_w1_csv,
             out_dir=Path(results_out_root)/dataset/"forest_plot"
         )
+        summary.setdefault("forest", {})
+    return summary
