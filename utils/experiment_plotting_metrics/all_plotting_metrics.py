@@ -468,19 +468,21 @@ def compute_w2_gate_tod_means_from_raw(
     """
     out = {}
     for stage_key, alias in [("S","s"),("M","m"),("D","d")]:
-        arr = gates_by_stage.get(stage_key) or gates_by_stage.get(stage_key.lower())
+        arr = gates_by_stage.get(stage_key)
+        if arr is None:
+            arr = gates_by_stage.get(stage_key.lower())
         if arr is None:
             continue
         t1d = _reduce_time_axis_auto(np.asarray(arr), dataset)
         out[f"gate_tod_mean_{alias}"] = [float(v) if np.isfinite(v) else np.nan for v in t1d]
 
     # TOD 길이 및 라벨
-    T = max(
+    lengths = [
         len(out.get("gate_tod_mean_s", [])),
         len(out.get("gate_tod_mean_m", [])),
         len(out.get("gate_tod_mean_d", [])),
-        default=0
-    )
+    ]
+    T = max(lengths) if lengths else 0
     out["tod_labels"] = list(range(T))
     return out
 
