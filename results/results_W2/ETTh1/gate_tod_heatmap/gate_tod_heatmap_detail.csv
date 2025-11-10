@@ -1,0 +1,13 @@
+experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag,tod,stage,gate_mean
+W2,ETTh1,gate_tod_heatmap,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,0,S,0.4987179934978485
+W2,ETTh1,gate_tod_heatmap,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,1,S,0.4985289871692657
+W2,ETTh1,gate_tod_heatmap,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,0,M,0.4977239966392517
+W2,ETTh1,gate_tod_heatmap,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,1,M,0.4969980120658874
+W2,ETTh1,gate_tod_heatmap,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,0,D,0.4964370131492615
+W2,ETTh1,gate_tod_heatmap,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,1,D,0.4918670058250427
+W2,ETTh1,gate_tod_heatmap,96,42,static,HyperConv,W2_ETTh1_96_42_static,0,S,0.4971109926700592
+W2,ETTh1,gate_tod_heatmap,96,42,static,HyperConv,W2_ETTh1_96_42_static,1,S,0.4988720118999481
+W2,ETTh1,gate_tod_heatmap,96,42,static,HyperConv,W2_ETTh1_96_42_static,0,M,0.49756699800491333
+W2,ETTh1,gate_tod_heatmap,96,42,static,HyperConv,W2_ETTh1_96_42_static,1,M,0.4989219903945923
+W2,ETTh1,gate_tod_heatmap,96,42,static,HyperConv,W2_ETTh1_96_42_static,0,D,0.4970270097255707
+W2,ETTh1,gate_tod_heatmap,96,42,static,HyperConv,W2_ETTh1_96_42_static,1,D,0.49799099564552307

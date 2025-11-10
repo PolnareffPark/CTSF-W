@@ -415,7 +415,9 @@ def compute_w2_gate_tod_means_from_raw(
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for stage_key, alias in [("S","s"),("M","m"),("D","d")]:
-        arr = gates_by_stage.get(stage_key) or gates_by_stage.get(stage_key.lower())
+        arr = gates_by_stage.get(stage_key)
+        if arr is None:
+            arr = gates_by_stage.get(stage_key.lower())
         if arr is None: 
             continue
         t1d = _to_numpy_1d_time(np.asarray(arr))
