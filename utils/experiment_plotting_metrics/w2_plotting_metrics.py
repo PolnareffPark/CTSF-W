@@ -329,15 +329,24 @@ def rebuild_w2_forest_summary(
     else:
         base["delta_var_time"] = np.nan
 
-    # Top-pick 점수 (무가중치 z 합)
-    def _top_score(gr: pd.DataFrame) -> pd.DataFrame:
-        z_rmse = _zscore(gr["delta_rmse_pct"].fillna(0.0))
-        z_tod  = _zscore(gr["delta_tod"].fillna(0.0))
-        z_var  = _zscore(gr["delta_var_time"].fillna(0.0))
-        gr["top_pick_score_w2"] = z_rmse + z_tod + z_var
-        return gr
+# --- Top-pick 점수 (무가중치 z 합) : deprecation-safe (transform 기반) ---
+    def _safe_z(s: pd.Series) -> pd.Series:
+        s = s.astype(float)
+        m = s.mean()
+        sd = s.std(ddof=0)
+        if not np.isfinite(sd) or sd == 0:
+            return pd.Series(np.zeros(len(s)), index=s.index)
+        return (s - m) / sd
 
-    base = base.groupby(list(group_keys), group_keys=False).apply(_top_score)
+    gcols = list(group_keys)
+    gp = base.groupby(gcols, group_keys=False)
+
+    z_rmse = gp["delta_rmse_pct"].transform(_safe_z).fillna(0.0)
+    z_tod  = gp["delta_tod"].transform(_safe_z).fillna(0.0)
+    z_var  = gp["delta_var_time"].transform(_safe_z).fillna(0.0)
+
+    base["top_pick_score_w2"] = z_rmse + z_tod + z_var
+# -------------------------------------------------------------------------
 
     def _ci_mean(a: np.ndarray) -> float:
         a = a[np.isfinite(a)]

@@ -408,26 +408,80 @@ def make_tod_labels(T: int, explicit: Optional[Iterable[int]] = None) -> np.ndar
         if lab.size == T: return lab
     return np.arange(T, dtype=int)
 
+# --- 데이터셋별 기대 TOD bin 개수 ---
+def _expected_tod_bins(dataset: str) -> int:
+    ds = (dataset or "").lower()
+    if "etth" in ds:     return 24    # 1 hour
+    if "ettm" in ds:     return 96    # 15 min
+    if "weather" in ds:  return 144   # 10 min
+    # 기타 데이터는 기본 24로 보수적 처리
+    return 24
+
+# --- 시간축 자동 추정 + 평균 축소 ---
+def _reduce_time_axis_auto(arr: np.ndarray, dataset: str) -> np.ndarray:
+    """
+    1) 기대 TOD 크기(ETTh=24, ETTm=96, weather=144)와 정확히 일치하는 축 우선
+    2) 그다음 기대값의 배수/약수에 해당하는 축(가장 근접 크기 우선)
+    3) 그래도 없으면 가장 큰 축
+    선택된 시간축을 제외한 축은 평균으로 축소하여 1D(T) 반환
+    """
+    a = np.asarray(arr, dtype=float)
+    if a.ndim == 1:  # 이미 1D면 시간축으로 간주
+        return a
+
+    expected = _expected_tod_bins(dataset)
+    shape = list(a.shape)
+
+    # 1) 정확 일치
+    exact = [ax for ax, sz in enumerate(shape) if sz == expected]
+
+    # 2) 배수/약수(가까운 크기 우선)
+    near = []
+    if not exact:
+        for ax, sz in enumerate(shape):
+            if sz >= 2 and (sz % expected == 0 or expected % sz == 0):
+                # 기대값과의 상대 오차를 점수화(작을수록 좋음)
+                ratio = max(sz, expected) / min(sz, expected)
+                near.append((ax, sz, ratio))
+        near.sort(key=lambda t: (t[2], abs(t[1]-expected)))  # ratio→크기차 순
+
+    if exact:
+        t_axis = exact[0]
+    elif near:
+        t_axis = near[0][0]
+    else:
+        # 3) 최후: 가장 긴 축
+        t_axis = int(np.argmax(shape))
+
+    # 시간축 외의 축 평균
+    axes = tuple(i for i in range(a.ndim) if i != t_axis)
+    return np.nanmean(a, axis=axes)
+
 def compute_w2_gate_tod_means_from_raw(
-    gates_by_stage: Dict[str, np.ndarray],  # {"S": arr, "M": arr, "D": arr}
+    gates_by_stage: dict,
     dataset: str,
-    tod_labels: Optional[Iterable[int]] = None
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+    tod_labels=None
+):
+    """
+    S/M/D 단계별 raw 게이트 텐서에서 시간축을 자동 탐지해서 TOD 평균 곡선을 생성
+    반환 dict에는 gate_tod_mean_s/m/d와 tod_labels가 포함됨
+    """
+    out = {}
     for stage_key, alias in [("S","s"),("M","m"),("D","d")]:
-        arr = gates_by_stage.get(stage_key)
+        arr = gates_by_stage.get(stage_key) or gates_by_stage.get(stage_key.lower())
         if arr is None:
-            arr = gates_by_stage.get(stage_key.lower())
-        if arr is None: 
             continue
-        t1d = _to_numpy_1d_time(np.asarray(arr))
+        t1d = _reduce_time_axis_auto(np.asarray(arr), dataset)
         out[f"gate_tod_mean_{alias}"] = [float(v) if np.isfinite(v) else np.nan for v in t1d]
-    T = max((
-        len(out.get("gate_tod_mean_s",[])),
-        len(out.get("gate_tod_mean_m",[])),
-        len(out.get("gate_tod_mean_d",[]))
-    ), default=0)
-    out["tod_labels"] = list(make_tod_labels(T, tod_labels))
+
+    # TOD 길이 및 라벨
+    T = max(
+        len(out.get("gate_tod_mean_s", [])),
+        len(out.get("gate_tod_mean_m", [])),
+        len(out.get("gate_tod_mean_d", [])),
+        default=0
+    )
+    out["tod_labels"] = list(range(T))
     return out
 
 def compute_w2_gate_distribution_stats_from_raw(

@@ -8,6 +8,17 @@ from typing import Dict, Optional
 from utils.metrics import _dcor_u, _multioutput_r2
 from scipy import stats
 
+def _safe_pearson_r2(x, y):
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if x.size < 2 or y.size < 2:
+        return np.nan
+    sx, sy = np.std(x, ddof=0), np.std(y, ddof=0)
+    if not np.isfinite(sx) or not np.isfinite(sy) or sx == 0 or sy == 0:
+        return np.nan
+    r = np.corrcoef(x, y)[0, 1]
+    return float(r*r) if np.isfinite(r) else np.nan
 
 def compute_w2_metrics(
     model,
@@ -155,8 +166,9 @@ def compute_w2_metrics(
             if len(gru_norm) == len(gate_per_sample_mean):
                 # 피어슨 상관계수 계산
                 try:
-                    corr = np.corrcoef(gate_per_sample_mean, gru_norm)[0, 1]
-                    metrics["w2_gate_gru_state_alignment"] = float(corr ** 2) if np.isfinite(corr) else np.nan
+                    metrics["w2_gate_gru_state_alignment"] = _safe_pearson_r2(
+                        gate_per_sample_mean, gru_norm
+                    )
                 except:
                     metrics["w2_gate_gru_state_alignment"] = np.nan
             else:
