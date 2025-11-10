@@ -472,8 +472,31 @@ class W2Experiment(BaseExperiment):
                     pass
         return model
 
-    def evaluate_test(self):
-        tod_vec = build_test_tod_vector(self.cfg)
+def evaluate_test(self):
+    """
+    - 게이트 출력과 GRU 상태를 모두 후킹하여 hooks_data에 담고,
+      compute_all_experiment_metrics(...)로 direct_evidence를 보강한 뒤,
+      self._last_hooks_data / self._last_direct에 저장합니다.
+    - 이로써 동적 모드에서 w2_gate_tod_alignment / w2_gate_gru_state_alignment가
+      정상 계산되어 results_W2.csv에 기록됩니다.
+    """
+    # 1) TOD 벡터 구성 (실험 설정 기반)
+    tod_vec = build_test_tod_vector(self.cfg)
+
+    # 2) 직접증거 평가 호출: 게이트/GRU 상태 모두 수집 시도
+    try:
+        direct = evaluate_with_direct_evidence(
+            self.model,
+            self.test_loader,
+            self.mu,
+            self.std,
+            tod_vec=tod_vec,
+            device=self.device,
+            collect_gate_outputs=True,
+            collect_gru_states=True,   # ★ 핵심: GRU 상태 후킹
+        )
+    except TypeError:
+        # 구버전 시그니처 호환(collect_gru_states 미지원 시 게이트만)
         direct = evaluate_with_direct_evidence(
             self.model,
             self.test_loader,
@@ -484,30 +507,40 @@ class W2Experiment(BaseExperiment):
             collect_gate_outputs=True,
         )
 
-        hooks_data: Dict[str, Any] = {}
-        w2_hooks = direct.pop("hooks_data", None)
-        if w2_hooks:
-            hooks_data.update(w2_hooks or {})
+    # 3) hooks_data 구성: 내부 hooks_data + 루트에 실려온 키를 보강 흡수
+    hooks_data: Dict[str, Any] = {}
+    w2_hooks = direct.pop("hooks_data", None)
+    if isinstance(w2_hooks, dict) and len(w2_hooks) > 0:
+        hooks_data.update(w2_hooks)
 
-        try:
-            exp_specific = compute_all_experiment_metrics(
-                experiment_type=self.experiment_type,
-                model=self.model,
-                hooks_data=hooks_data if hooks_data else None,
-                tod_vec=tod_vec,
-                direct_evidence=direct,
-                perturbation_type=self.cfg.get("perturbation"),
-                active_layers=[],
-            )
+    # 루트에 있을 수도 있는 후킹 산출물을 안전하게 병합
+    for k in ("gate_outputs", "gru_states", "gates_by_stage", "gate_by_stage"):
+        if k in direct and k not in hooks_data:
+            hooks_data[k] = direct[k]
+
+    # 4) 실험 공통 지표 계산(있으면 direct에 병합)
+    try:
+        exp_specific = compute_all_experiment_metrics(
+            experiment_type=self.experiment_type,
+            model=self.model,
+            hooks_data=hooks_data if hooks_data else None,
+            tod_vec=tod_vec,
+            direct_evidence=direct,
+            perturbation_type=self.cfg.get("perturbation"),
+            active_layers=[],
+        )
+        if isinstance(exp_specific, dict):
             for k, v in exp_specific.items():
                 direct[k] = v
-        except ImportError:
-            pass
+    except ImportError:
+        # 선택적 모듈이 없는 환경 호환
+        pass
 
-        self._plotting_payload = {}
-        self._last_hooks_data = copy.deepcopy(hooks_data)
-        self._last_direct = copy.deepcopy(direct)
-        return direct
+    # 5) 최종 캐싱(그림/표 단계에서 사용)
+    self._plotting_payload = {}
+    self._last_hooks_data = copy.deepcopy(hooks_data)
+    self._last_direct = copy.deepcopy(direct)
+    return direct
 
     def run(self) -> bool:
         try:
