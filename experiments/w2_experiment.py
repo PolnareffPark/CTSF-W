@@ -16,8 +16,10 @@ import pandas as pd
 from data.dataset import build_test_tod_vector
 from models.ctsf_model import HybridTS
 from models.experiment_variants import StaticCrossModel
+
 from utils.direct_evidence import evaluate_with_direct_evidence
 from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
+from utils.experiment_metrics.w2_metrics import compute_w2_metrics
 from utils.experiment_plotting_metrics.all_plotting_metrics import (
     infer_tod_bins_by_dataset,
     package_w2_gate_metrics,
@@ -45,6 +47,31 @@ _W2_KEYS = [
     "run_tag",
 ]
 
+_CG_GC_KEYS = [
+    "mse_std","mae_std",
+    "cg_pearson_mean","cg_spearman_mean","cg_dcor_mean",
+    "cg_event_gain","cg_event_hit","cg_maxcorr","cg_bestlag",
+    "gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2",
+    "gc_kernel_feat_dcor","gc_kernel_feat_align"
+]
+
+def _merge_cg_gc_from_direct_evidence(row: dict, direct_evidence: dict | None) -> dict:
+    """direct_evidence dict에 있으면 해당 키들을 row에 주입"""
+    if not isinstance(direct_evidence, dict):
+        return row
+    for k in _CG_GC_KEYS:
+        if k in direct_evidence:
+            try: row[k] = float(direct_evidence[k])
+            except Exception: row[k] = direct_evidence[k]
+    return row
+
+def _amp_range(x) -> float:
+    """TOD 민감도(range) 계산"""
+    import numpy as np
+    arr = np.asarray(x, dtype=float)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return float("nan")
+    return float(np.nanmax(arr) - np.nanmin(arr))
 
 # ---------------------------
 # 공통 유틸 (W1과 동일 정책)
@@ -308,25 +335,101 @@ class W2Experiment(BaseExperiment):
             )
 
         results_csv = RESULTS_ROOT / f"results_{EXP_TAG}.csv"
+        
+        # 1) TOD 민감도/게이트 통계 계산/보강
+        #    - gate_metrics에는 gate_mean/std/entropy, gate_tod_mean_s/m/d 등이 있을 수 있음
+        gate_mean   = float(gate_metrics.get("gate_mean", np.nan))
+        gate_std    = float(gate_metrics.get("gate_std", np.nan))
+        gate_entropy= float(gate_metrics.get("gate_entropy", np.nan))
+        gate_sparsity = float(gate_metrics.get("gate_sparsity", np.nan)) if "gate_sparsity" in gate_metrics else np.nan
+
+        # TOD 평균(스테이지별 평균값) 및 민감도(range)
+        def _safe_mean_key(k):
+            v = gate_metrics.get(k, None)
+            try:
+                return float(np.nanmean(np.asarray(v, dtype=float))) if v is not None else np.nan
+            except Exception:
+                return np.nan
+        gate_tod_mean_s = _safe_mean_key("gate_tod_mean_s")
+        gate_tod_mean_m = _safe_mean_key("gate_tod_mean_m")
+        gate_tod_mean_d = _safe_mean_key("gate_tod_mean_d")
+        tod_amp_mean = np.nan
+        amps = []
+        for k in ["gate_tod_mean_s","gate_tod_mean_m","gate_tod_mean_d"]:
+            if k in gate_metrics and gate_metrics[k] is not None:
+                amps.append(_amp_range(gate_metrics[k]))
+        if len([a for a in amps if np.isfinite(a)])>0:
+            tod_amp_mean = float(np.nanmean([a for a in amps if np.isfinite(a)]))
+
+        # 분위수/상위 히스토그램 지표 (gate_values로 직접 산출; 없으면 NaN)
+        gate_q10 = gate_q50 = gate_q90 = gate_hist10 = np.nan
+        if gates_all.size > 0 and np.isfinite(gates_all).any():
+            finite = gates_all[np.isfinite(gates_all)]
+            if finite.size >= 5:
+                gate_q10, gate_q50, gate_q90 = np.quantile(finite, [0.10, 0.50, 0.90]).tolist()
+                gate_hist10 = float((finite > gate_q90).mean())
+
+        # 2) W2 전용 지표 계산(가능 시 hooks/tod_vec/ direct_evidence와 함께)
+        try:
+            from data.dataset import build_test_tod_vector  # 상단에 이미 import되어 있음
+            tod_vec = build_test_tod_vector(self.cfg)
+        except Exception:
+            tod_vec = None
+
+        try:
+            w2m = compute_w2_metrics(
+                self.model,
+                hooks_data=hooks,                 # evaluate_test에서 취합한 hooks
+                tod_vec=tod_vec,
+                direct_evidence=direct            # evaluate_with_direct_evidence + compute_all_experiment_metrics의 결과
+            )
+        except Exception:
+            w2m = {}
+
+        # alias 맵핑(보고서/표 호환)
+        gate_var_t = w2m.get("w2_gate_variability_time", gate_metrics.get("w2_gate_variability_time", np.nan))
+        gate_var_b = w2m.get("w2_gate_variability_sample", np.nan)
+        gate_channel_kurt     = w2m.get("w2_channel_selectivity_kurtosis", np.nan)
+        gate_channel_sparsity = w2m.get("w2_channel_selectivity_sparsity", np.nan)
+
+        # 3) row 구성
         row = {
-            "dataset": dataset,
-            "horizon": horizon,
-            "seed": seed,
-            "mode": mode,
-            "model_tag": model_tag,
-            "experiment_type": EXP_TAG,
+            "dataset": dataset, "horizon": horizon, "seed": seed, "mode": mode,
+            "model_tag": model_tag, "experiment_type": EXP_TAG,
             "mse_real": float(direct.get("mse_real", np.nan)),
-            "rmse": rmse_real,
-            "mae": mae_real,
-            "tod_amp_mean": gate_metrics.get("tod_amp_mean", np.nan),
-            "gate_mean": gate_metrics.get("gate_mean", np.nan),
-            "gate_std": gate_metrics.get("gate_std", np.nan),
-            "w2_gate_variability_time": gate_metrics.get("w2_gate_variability_time", np.nan),
+            "rmse": rmse_real, "mae": mae_real,
+
+            # Gate 전역 요약
+            "gate_mean": gate_mean, "gate_std": gate_std,
+            "gate_entropy": gate_entropy, "gate_sparsity": gate_sparsity,
+            "gate_q10": gate_q10, "gate_q50": gate_q50, "gate_q90": gate_q90,
+            "gate_hist10": gate_hist10,
+
+            # TOD 요약
+            "gate_tod_mean_s": gate_tod_mean_s,
+            "gate_tod_mean_m": gate_tod_mean_m,
+            "gate_tod_mean_d": gate_tod_mean_d,
+            "tod_amp_mean": tod_amp_mean,
+
+            # W2 전용 지표
+            **w2m,
+
+            # 별칭(보고서 호환 컬럼명)
+            "gate_var_t": gate_var_t,
+            "gate_var_b": gate_var_b,
+            "gate_channel_kurt": gate_channel_kurt,
+            "gate_channel_sparsity": gate_channel_sparsity,
         }
+
+        # 4) direct_evidence에서 cg_*/gc_* 등 있으면 병합
+        row = _merge_cg_gc_from_direct_evidence(row, direct)
+
+        # 5) append+dedupe 저장
+        results_csv = RESULTS_ROOT / f"results_{EXP_TAG}.csv"
         self._append_or_update_results(
             results_csv,
             row,
-            subset=["dataset", "horizon", "seed", "mode", "model_tag", "experiment_type"],
+            subset=["dataset","horizon","seed","mode","model_tag","experiment_type"],
         )
 
     def _append_or_update_results(
