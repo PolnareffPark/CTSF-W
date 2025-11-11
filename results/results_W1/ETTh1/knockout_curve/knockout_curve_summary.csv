@@ -1,4 +1,0 @@
-experiment_type,dataset,plot_type,horizon,seed,mode,w1_knockout_base_rmse,w1_knockout_delta_mean,w1_knockout_delta_max,w1_knockout_delta_min
-W1,ETTh1,knockout_curve,96,42,per_layer,3.065920113485175,-0.0006103583470501,0.0002161299766938,-0.0028350757703052
-W1,ETTh1,knockout_curve,96,42,last_layer,3.2985084717604023,0.0,0.0,0.0
-W1,ETTh1,knockout_curve,192,42,per_layer,3.1922479968283155,-0.0005452222221649095,0.000543825466698511,-0.0034079404996520957
