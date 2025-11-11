@@ -3,50 +3,75 @@
 #   - W2 실험 특화 지표(정렬·변동성·선택도·이벤트 반응) 완성본
 # ============================================================
 
-from __future__ import annotations
 from typing import Dict, Optional
 import numpy as np
 from scipy import stats
+from utils.metrics import _dcor_u
 
-from utils.metrics import _dcor_u  # 거리상관(U-statistic)
-
-def _safe_pearson_r2(x, y) -> float:
-    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    x, y = x[mask], y[mask]
-    if x.size < 3 or y.size < 3:
-        return np.nan
-    sx, sy = np.std(x, ddof=0), np.std(y, ddof=0)
-    if not np.isfinite(sx) or not np.isfinite(sy) or sx == 0 or sy == 0:
-        return np.nan
-    r = np.corrcoef(x, y)[0, 1]
-    return float(r*r) if np.isfinite(r) else np.nan
-
-def _asf(x):
+def _as_np(a):
     try:
-        a = np.asarray(x, dtype=float)
-        return a if np.isfinite(a).any() else None
+        if hasattr(a, "detach"):
+            a = a.detach().cpu().numpy()
+        return np.asarray(a)
     except Exception:
         return None
 
-def _collapse_per_sample(a: np.ndarray, n_expected: Optional[int] = None) -> np.ndarray:
-    """
-    배치/레이어/게이트 축을 평균해 샘플 축만 남김.
-    n_expected가 주어지면 그 크기와 일치하는 축을 우선적으로 샘플 축으로 선택.
-    """
-    a = np.asarray(a, dtype=float)
-    if a.ndim == 1:
+def _to_NLG(arr: np.ndarray) -> Optional[np.ndarray]:
+    """게이트 텐서를 (N,L,G)로 표준화."""
+    a = _as_np(arr)
+    if a is None or a.ndim < 2:
+        return None
+    if a.ndim == 3:  # (N,L,G)
         return a
-    if n_expected is not None and n_expected > 1:
-        cand = [ax for ax, sz in enumerate(a.shape) if sz == n_expected]
-        s_ax = cand[0] if cand else int(np.argmax(a.shape))
-    else:
-        s_ax = int(np.argmax(a.shape))
-    axes = tuple(i for i in range(a.ndim) if i != s_ax)
-    v = np.nanmean(a, axis=axes) if axes else a
-    return v.reshape(-1)
+    if a.ndim >= 4:
+        N = a.shape[0]
+        G = a.shape[-1]
+        L = int(np.prod(a.shape[1:-1]))
+        return a.reshape(N, L, G)
+    if a.ndim == 2:  # (N,G) 가정
+        return a.reshape(a.shape[0], 1, a.shape[1])
+    return None
 
-def _align_same_len(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _concat_gate_outputs(gate_list):
+    """list of arrays -> (N,L,G) 연결."""
+    bags = []
+    for item in gate_list:
+        ng = _to_NLG(item)
+        if ng is not None:
+            bags.append(ng)
+    if not bags:
+        return None
+    try:
+        return np.concatenate(bags, axis=0)
+    except Exception:
+        return bags[0]
+
+def _safe_kurtosis(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("nan")
+    if np.allclose(x, x[0]):  # 상수벡터
+        return 0.0
+    try:
+        return float(stats.kurtosis(x, fisher=True, bias=False, nan_policy="omit"))
+    except Exception:
+        return float("nan")
+
+def _hoyer_sparsity(x: np.ndarray) -> float:
+    x = np.abs(np.asarray(x, float))
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n == 0:
+        return float("nan")
+    l1 = float(np.sum(x))
+    l2 = float(np.linalg.norm(x))
+    if l2 == 0.0:
+        return 0.0
+    # (sqrt(n) - L1/L2) / (sqrt(n) - 1)  in [0,1]
+    return float((np.sqrt(n) - l1 / l2) / (np.sqrt(n) - 1.0 + 1e-12))
+
+def _align_len(x: np.ndarray, y: np.ndarray):
     L = min(len(x), len(y))
     if L < 3:
         return np.array([]), np.array([])
@@ -60,120 +85,137 @@ def compute_w2_metrics(
     **kwargs
 ) -> Dict:
     """
-    동적/정적 모두 대응. 훅 키를 폭넓게 수용하고, 길이 불일치 시 공통 길이로 자동 정렬.
-    dynamic일 때 w2_gate_tod_alignment / w2_gate_gru_state_alignment가 비지 않도록 강건화.
+    W2 특화 지표(동적/정적). 동적이면 실측 gate_outputs, 정적이면 stage별/alpha 기반.
+    반환: w2_gate_variability_time, w2_gate_variability_sample, w2_gate_entropy,
+         w2_gate_tod_alignment, w2_gate_gru_state_alignment,
+         w2_event_conditional_response, w2_channel_selectivity_kurtosis, w2_channel_selectivity_sparsity
     """
-    metrics: Dict[str, float] = {}
+    m: Dict[str, float] = {
+        "w2_gate_variability_time": float("nan"),
+        "w2_gate_variability_sample": float("nan"),
+        "w2_gate_entropy": float("nan"),
+        "w2_gate_tod_alignment": float("nan"),
+        "w2_gate_gru_state_alignment": float("nan"),
+        "w2_event_conditional_response": float("nan"),
+        "w2_channel_selectivity_kurtosis": float("nan"),
+        "w2_channel_selectivity_sparsity": float("nan"),
+    }
 
-    gate_per_sample = None
-    gru_per_sample  = None
-    N_tod = tod_vec.shape[0] if isinstance(tod_vec, np.ndarray) else None
+    # -----------------------
+    # 1) 게이트 텐서 수집
+    # -----------------------
+    gates_NLG = None          # (N,L,G)
+    gate_channel_vector = None  # (G,)
+    gru_list = []
 
-    # 1) 게이트/GRU 훅 수집
-    if hooks_data:
-        # Gate candidates
-        gate_src = None
-        for k in ["gate_outputs","gates","gate_values","gate_output_list","gates_time_major"]:
-            if k in hooks_data and hooks_data[k] is not None:
-                gate_src = hooks_data[k]; break
-        if gate_src is None:
-            # stage dict에서도 수집 허용
-            for k in ["gates_by_stage","gate_by_stage","gate_logs_by_stage"]:
-                if k in hooks_data and isinstance(hooks_data[k], dict) and hooks_data[k]:
-                    arrs = []
-                    for s in ["S","M","D","s","m","d"]:
-                        if s in hooks_data[k]:
-                            a = _asf(hooks_data[k][s])
-                            if a is not None: arrs.append(a)
-                    if arrs:
-                        gate_src = np.stack(arrs, axis=0)
+    if isinstance(hooks_data, dict):
+        # a) 동적 게이트: gate_outputs(list) 우선
+        if "gate_outputs" in hooks_data and hooks_data["gate_outputs"]:
+            gates_NLG = _concat_gate_outputs(hooks_data["gate_outputs"])
+        # b) stage dict 허용
+        if gates_NLG is None:
+            for k in ("gates_by_stage", "gate_by_stage", "gate_logs_by_stage"):
+                d = hooks_data.get(k)
+                if isinstance(d, dict) and d:
+                    stage_vecs = []
+                    for s in ("S", "M", "D", "s", "m", "d"):
+                        if s in d and d[s] is not None:
+                            a = _as_np(d[s])
+                            if a is None:
+                                continue
+                            a = np.asarray(a, float)
+                            # 마지막 축이 게이트 차원이라고 가정하고 나머지 평균
+                            if a.ndim == 1:
+                                stage_vecs.append(a.reshape(1, -1))
+                            else:
+                                gdim = -1
+                                axes = tuple(i for i in range(a.ndim) if i != gdim)
+                                stage_vecs.append(np.nanmean(a, axis=axes, keepdims=True))
+                    if stage_vecs:
+                        gate_channel_vector = np.nanmean(np.concatenate(stage_vecs, axis=0), axis=0).reshape(-1)
                     break
-        if gate_src is not None:
-            if isinstance(gate_src, list):
-                ps = []
-                for a in gate_src:
-                    a = _asf(a)
-                    if a is not None:
-                        ps.append(_collapse_per_sample(a, n_expected=N_tod))
-                if len(ps)>0:
-                    gate_per_sample = np.concatenate(ps, axis=0)
-            else:
-                a = _asf(gate_src)
-                if a is not None:
-                    gate_per_sample = _collapse_per_sample(a, n_expected=N_tod)
-
-        # GRU candidates
-        for k in ["gru_states","gru_hidden","gru_h_list","h_list","hidden_states"]:
+        # GRU 상태(가능하면)
+        for k in ("gru_states", "gru_hidden", "gru_h_list", "h_list", "hidden_states"):
             if k in hooks_data and hooks_data[k] is not None:
-                v = hooks_data[k]
-                if isinstance(v, list):
-                    ps = []
-                    for a in v:
-                        a = _asf(a)
-                        if a is not None:
-                            ps.append(_collapse_per_sample(a, n_expected=N_tod))
-                    if len(ps)>0:
-                        gru_per_sample = np.concatenate(ps, axis=0)
-                else:
-                    a = _asf(v)
-                    if a is not None:
-                        gru_per_sample = _collapse_per_sample(a, n_expected=N_tod)
+                gru_list = hooks_data[k] if isinstance(hooks_data[k], list) else [hooks_data[k]]
                 break
 
-    # 2) 변동성/엔트로피
-    if gate_per_sample is not None:
-        metrics["w2_gate_variability_time"]   = float(np.nanstd(gate_per_sample))
-        metrics["w2_gate_variability_sample"] = float(np.nanstd(gate_per_sample))
-        pos = gate_per_sample[gate_per_sample > 1e-8]
+    # c) 완전 폴백(정적 모델 파라미터)
+    if gates_NLG is None and gate_channel_vector is None and hasattr(model, "xhconv_blks"):
+        chans = []
+        for blk in getattr(model, "xhconv_blks", []):
+            for name in ("alpha", "cross_gate", "gate", "w", "g"):
+                if hasattr(blk, name):
+                    v = _as_np(getattr(blk, name))
+                    if v is None:
+                        continue
+                    v = np.asarray(v, float)
+                    if v.ndim == 2:  # (2,2) 등
+                        chans.append(v.reshape(-1))
+                        break
+                    if v.ndim == 1:
+                        chans.append(v)
+                        break
+        if chans:
+            gate_channel_vector = np.nanmean(np.stack(chans, axis=0), axis=0).reshape(-1)
+
+    # -----------------------
+    # 2) 지표 계산
+    # -----------------------
+    is_dynamic = isinstance(gates_NLG, np.ndarray)
+
+    if is_dynamic:
+        # (N,L,G)
+        N, L, G = gates_NLG.shape
+        # 시간/샘플 변동성
+        m["w2_gate_variability_time"]   = float(np.nanmean(np.nanstd(gates_NLG.reshape(N, -1), axis=1)))
+        m["w2_gate_variability_sample"] = float(np.nanmean(np.nanstd(gates_NLG, axis=0)))  # (L,G) std의 평균
+        # 엔트로피
+        flat = gates_NLG.reshape(-1)
+        pos = flat[np.isfinite(flat) & (flat > 1e-8)]
         if pos.size > 0:
             p = pos / (pos.sum() + 1e-12)
-            metrics["w2_gate_entropy"] = float(-np.sum(p*np.log(p + 1e-12)))
-        else:
-            metrics["w2_gate_entropy"] = float("nan")
-    else:
-        metrics["w2_gate_variability_time"]   = float("nan")
-        metrics["w2_gate_variability_sample"] = float("nan")
-        metrics["w2_gate_entropy"]            = float("nan")
-
-    metrics.setdefault("w2_channel_selectivity_kurtosis", float("nan"))
-    metrics.setdefault("w2_channel_selectivity_sparsity", float("nan"))
-
-    # 3) TOD 정렬
-    if gate_per_sample is not None and isinstance(tod_vec, np.ndarray):
-        gx = gate_per_sample.reshape(-1)
-        ty = np.asarray(tod_vec, dtype=float).reshape(-1, 2)
-        gx, ty = _align_same_len(gx, ty)
-        if gx.size >= 3 and ty.size >= 3:
+            m["w2_gate_entropy"] = float(-np.sum(p * np.log(p + 1e-12)))
+        # TOD 정렬
+        if isinstance(tod_vec, np.ndarray) and tod_vec.ndim == 2 and tod_vec.shape[0] > 2:
+            g_strength = np.nanmean(gates_NLG, axis=(1, 2))  # (N,)
+            gx, ty = _align_len(g_strength.reshape(-1), tod_vec.reshape(len(tod_vec), -1))
+            if gx.size >= 3:
+                try:
+                    m["w2_gate_tod_alignment"] = float(_dcor_u(gx.reshape(-1,1), ty))
+                except Exception:
+                    m["w2_gate_tod_alignment"] = float("nan")
+        # GRU 정렬
+        if gru_list:
             try:
-                metrics["w2_gate_tod_alignment"] = _dcor_u(gx.reshape(-1,1), ty)
+                gru = np.concatenate([_as_np(a) for a in gru_list if _as_np(a) is not None], axis=0)
+                if gru.ndim >= 2:
+                    g_strength = np.nanmean(gates_NLG, axis=(1, 2))
+                    gn = np.linalg.norm(gru, axis=1)
+                    gx, hy = _align_len(g_strength.reshape(-1), gn.reshape(-1))
+                    if gx.size >= 3:
+                        r = np.corrcoef(gx, hy)[0, 1]
+                        m["w2_gate_gru_state_alignment"] = float(r * r) if np.isfinite(r) else float("nan")
             except Exception:
-                metrics["w2_gate_tod_alignment"] = float("nan")
-        else:
-            metrics["w2_gate_tod_alignment"] = float("nan")
+                pass
+        # 채널 선택도(동적): (G,)
+        gate_channel_vector = np.nanmean(gates_NLG, axis=(0, 1))  # (G,)
     else:
-        metrics["w2_gate_tod_alignment"] = float("nan")
+        # static: TOD/GRU 정렬은 정의상 0.0
+        m["w2_gate_tod_alignment"] = 0.0
+        m["w2_gate_gru_state_alignment"] = 0.0
 
-    # 4) GRU 정렬(r^2)
-    if gate_per_sample is not None and gru_per_sample is not None:
-        gx = gate_per_sample.reshape(-1)
-        hy = gru_per_sample.reshape(-1)
-        gx, hy = _align_same_len(gx, hy)
-        metrics["w2_gate_gru_state_alignment"] = _safe_pearson_r2(gx, hy)
-    else:
-        metrics["w2_gate_gru_state_alignment"] = float("nan")
+    # 채널 선택도(첨도/희소성): 동적이면 위에서 설정, 아니면 폴백 벡터 사용
+    if gate_channel_vector is not None and gate_channel_vector.size >= 2:
+        m["w2_channel_selectivity_kurtosis"] = _safe_kurtosis(gate_channel_vector)
+        m["w2_channel_selectivity_sparsity"] = _hoyer_sparsity(gate_channel_vector)
 
-    # 5) 채널 선택도 (첨도/희소성) - 훅이 채널 축을 제공하지 않는 환경에서는 NaN 유지가 안전
-    # (추후 per-channel 훅이 추가되면 여기를 보강)
+    # 이벤트 조건 반응(있는 경우만)
+    cg_event_gain = None
+    if isinstance(direct_evidence, dict):
+        cg_event_gain = direct_evidence.get("cg_event_gain", None)
+    if (cg_event_gain is not None and isinstance(cg_event_gain, (int,float)) 
+        and np.isfinite(cg_event_gain) and np.isfinite(m.get("w2_gate_variability_time", np.nan))):
+        m["w2_event_conditional_response"] = float(m["w2_gate_variability_time"] * cg_event_gain)
 
-    # 6) 이벤트 조건 반응(동적에 한해 정의)
-    if direct_evidence is not None and gate_per_sample is not None:
-        cg_event_gain = direct_evidence.get("cg_event_gain", np.nan)
-        if np.isfinite(cg_event_gain):
-            gv = metrics.get("w2_gate_variability_time", np.nan)
-            metrics["w2_event_conditional_response"] = float(gv * cg_event_gain) if np.isfinite(gv) else float("nan")
-        else:
-            metrics["w2_event_conditional_response"] = float("nan")
-    else:
-        metrics["w2_event_conditional_response"] = float("nan")
-
-    return metrics
+    return m

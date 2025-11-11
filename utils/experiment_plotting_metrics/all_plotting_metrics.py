@@ -15,6 +15,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Sequence, Tuple
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -377,30 +378,66 @@ def build_forest_from_results(
 # ============================================================
 # (Append) W2 계산 유틸 (게이트 실측치로부터 완전 계산)
 # ============================================================
-from typing import Iterable, Optional, Dict, Any, Tuple
-import numpy as np
-
-def _np(x):
-    return np.asarray(x, dtype=float)
-
-def _to_numpy_1d_time(x: np.ndarray) -> np.ndarray:
-    """
-    임의 차원 (N, T, C) / (T, C) / (T,) 등에서 시간축 T만 남겨 1D로 평균 축소.
-    시간축은 마지막에서 두번째 차원(-2)로 가정.
-    """
-    arr = np.asarray(x, dtype=float)
-    if arr.ndim == 1:
-        return arr
-    T = arr.shape[-2] if arr.ndim >= 2 else arr.shape[0]
-    axes = tuple(i for i in range(arr.ndim) if i != arr.ndim-2)
-    if axes:
-        arr = np.nanmean(arr, axis=axes)
-    return arr
-
 def infer_tod_bins_by_dataset(dataset: str) -> int:
     ds = (dataset or "").lower()
-    if "ettm" in ds: return 96
-    return 24  # ETTh, weather 등 기본 24
+    if "etth" in ds:    return 24      # 1-hour
+    if "ettm" in ds:    return 96      # 15-min
+    if "weather" in ds: return 144     # 10-min (프로젝트 규약)
+    return 24
+
+def _collapse_to_samples(arr: np.ndarray, n_expected: int | None = None) -> np.ndarray:
+    """게이트 텐서에서 '샘플 축'만 남기고 평균 (나머지 축 평균)."""
+    a = np.asarray(arr, dtype=float)
+    if a.ndim == 1:
+        return a
+    if n_expected and n_expected in a.shape:
+        s_ax = list(a.shape).index(n_expected)
+    else:
+        # 가장 긴 축을 샘플 축으로 간주
+        s_ax = int(np.argmax(a.shape))
+    axes = tuple(i for i in range(a.ndim) if i != s_ax)
+    v = np.nanmean(a, axis=axes) if axes else a
+    return v.reshape(-1)
+
+
+def _match_length(x: np.ndarray, target: int) -> np.ndarray:
+    """
+    입력 벡터 x를 target 길이에 맞추어 반환.
+    - 길이가 같으면 그대로 반환
+    - 더 길면 잘라냄
+    - 더 짧으면 반복/패딩(NaN)으로 맞춤
+    """
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if target <= 0:
+        return x
+    if x.size == target:
+        return x
+    if x.size == 0:
+        return np.full(target, np.nan, dtype=float)
+    if x.size > target:
+        return x[:target]
+    reps = int(np.ceil(target / x.size))
+    tiled = np.tile(x, reps)[:target]
+    return tiled
+
+def _tod_bin_index_from_sincos(tod_vec: np.ndarray, n_bins: int) -> np.ndarray:
+    assert tod_vec.ndim == 2 and tod_vec.shape[1] >= 2, "tod_vec must be (N,2)=[sin,cos]"
+    sin_t = tod_vec[:, 0]
+    cos_t = tod_vec[:, 1]
+    ang = np.arctan2(sin_t, cos_t)              # [-pi, pi]
+    ang = (ang + 2*np.pi) % (2*np.pi)           # [0, 2pi)
+    idx = np.floor(ang / (2*np.pi) * n_bins).astype(int)
+    # 안전 차단(이론상 필요 없지만 가드):
+    idx = np.clip(idx, 0, n_bins - 1)
+    return idx
+
+
+def _bin_means(x: np.ndarray, idx: np.ndarray, n_bins: int) -> list[float]:
+    out = []
+    for b in range(n_bins):
+        m = np.nanmean(x[idx == b]) if np.any(idx == b) else np.nan
+        out.append(float(m) if np.isfinite(m) else np.nan)
+    return out
 
 def make_tod_labels(T: int, explicit: Optional[Iterable[int]] = None) -> np.ndarray:
     if explicit is not None:
@@ -429,7 +466,7 @@ def _reduce_time_axis_auto(arr: np.ndarray, dataset: str) -> np.ndarray:
     if a.ndim == 1:  # 이미 1D면 시간축으로 간주
         return a
 
-    expected = _expected_tod_bins(dataset)
+    expected = infer_tod_bins_by_dataset(dataset)
     shape = list(a.shape)
 
     # 1) 정확 일치
@@ -458,32 +495,60 @@ def _reduce_time_axis_auto(arr: np.ndarray, dataset: str) -> np.ndarray:
     return np.nanmean(a, axis=axes)
 
 def compute_w2_gate_tod_means_from_raw(
-    gates_by_stage: dict,
+    gates_by_stage: Dict[str, np.ndarray] | None,
     dataset: str,
-    tod_labels=None
-):
+    tod_labels: Optional[Iterable[int]] = None,
+    tod_vec: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
     """
-    S/M/D 단계별 raw 게이트 텐서에서 시간축을 자동 탐지해서 TOD 평균 곡선을 생성
-    반환 dict에는 gate_tod_mean_s/m/d와 tod_labels가 포함됨
+    S/M/D 단계별 raw 게이트 텐서에서 TOD 평균 곡선을 생성.
+    - tod_vec이 주어지면 sin/cos → TOD bin(ETTh=24/ETTm=96/weather=144)으로 집계
+    - 없으면 기존 축 자동 탐지 기반으로 fallback
     """
-    out = {}
-    for stage_key, alias in [("S","s"),("M","m"),("D","d")]:
-        arr = gates_by_stage.get(stage_key)
-        if arr is None:
-            arr = gates_by_stage.get(stage_key.lower())
+    out: Dict[str, Any] = {}
+    gates_by_stage = gates_by_stage or {}
+
+    if tod_vec is not None and len(tod_vec) > 0:
+        n_bins = infer_tod_bins_by_dataset(dataset)
+        tod_vec = np.asarray(tod_vec, dtype=float)
+        bin_idx = _tod_bin_index_from_sincos(tod_vec, n_bins)
+        n_samples = len(bin_idx)
+
+        for stage_key, alias in [("S", "s"), ("M", "m"), ("D", "d")]:
+            arr = None
+            if stage_key in gates_by_stage:
+                arr = gates_by_stage[stage_key]
+            elif stage_key.lower() in gates_by_stage:
+                arr = gates_by_stage[stage_key.lower()]
+            if arr is None:
+                continue
+
+            samples = _collapse_to_samples(np.asarray(arr, dtype=float), n_expected=n_samples)
+            samples = _match_length(samples, n_samples)
+            out[f"gate_tod_mean_{alias}"] = _bin_means(samples, bin_idx, n_bins)
+
+        out["tod_labels"] = list(range(n_bins))
+        return out
+
+    # --- Fallback: sin/cos 미제공 시 기존 축 기반 평균 ---
+    for stage_key, alias in [("S", "s"), ("M", "m"), ("D", "d")]:
+        arr = None
+        if stage_key in gates_by_stage:
+            arr = gates_by_stage[stage_key]
+        elif stage_key.lower() in gates_by_stage:
+            arr = gates_by_stage[stage_key.lower()]
         if arr is None:
             continue
-        t1d = _reduce_time_axis_auto(np.asarray(arr), dataset)
+        t1d = _reduce_time_axis_auto(np.asarray(arr, dtype=float), dataset)
         out[f"gate_tod_mean_{alias}"] = [float(v) if np.isfinite(v) else np.nan for v in t1d]
 
-    # TOD 길이 및 라벨
     lengths = [
         len(out.get("gate_tod_mean_s", [])),
         len(out.get("gate_tod_mean_m", [])),
         len(out.get("gate_tod_mean_d", [])),
     ]
     T = max(lengths) if lengths else 0
-    out["tod_labels"] = list(range(T))
+    out["tod_labels"] = list(make_tod_labels(T, tod_labels))
     return out
 
 def compute_w2_gate_distribution_stats_from_raw(
@@ -527,13 +592,36 @@ def compute_w2_time_variability(gates_time_major: np.ndarray) -> float:
     return float(np.nanmean(std_t))
 
 def package_w2_gate_metrics(
-    gates_by_stage: Dict[str, np.ndarray],
-    gates_all: np.ndarray,
+    *,
+    gates_by_stage: Optional[Dict[str, np.ndarray]],
+    gates_all: Optional[np.ndarray],
     dataset: str,
-    tod_labels: Optional[Iterable[int]] = None
+    tod_labels: Optional[Iterable[int]] = None,
+    tod_vec: Optional[np.ndarray] = None,
+    return_channel_stats: bool = False,
 ) -> Dict[str, Any]:
-    tod = compute_w2_gate_tod_means_from_raw(gates_by_stage, dataset=dataset, tod_labels=tod_labels)
-    dist = compute_w2_gate_distribution_stats_from_raw(gates_all, sparsity_thr=1e-3)
-    varT = compute_w2_time_variability(gates_all)
-    dist["w2_gate_variability_time"] = float(varT)
-    return {**tod, **dist}
+    out: Dict[str, Any] = {}
+
+    # TOD 기반 요약
+    out.update(
+        compute_w2_gate_tod_means_from_raw(
+            gates_by_stage or {},
+            dataset=dataset,
+            tod_labels=tod_labels,
+            tod_vec=tod_vec,
+        )
+    )
+
+    # 게이트 분포 요약
+    if isinstance(gates_all, np.ndarray) and gates_all.size > 0 and np.isfinite(gates_all).any():
+        dist = compute_w2_gate_distribution_stats_from_raw(
+            gates_all,
+            sparsity_thr=1e-3,
+            return_channel_stats=return_channel_stats,
+        )
+        dist["w2_gate_variability_time"] = float(compute_w2_time_variability(gates_all))
+        out.update(dist)
+    else:
+        out.setdefault("w2_gate_variability_time", np.nan)
+
+    return out

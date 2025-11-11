@@ -195,9 +195,9 @@ class W2Experiment(BaseExperiment):
     # ---------------------------------------------------------
     def evaluate_test(self):
         """
-        - 게이트/GRU 훅을 폭넓게 수집하여 hooks_data에 정규화
-        - 실험별 메트릭을 direct에 병합
-        - 사후 저장 단계에서 w2_* / cg_* / gc_*가 results_W2.csv에 반영되도록 보장
+        - 게이트 출력과 GRU 상태를 모두 후킹하여 hooks_data에 담고,
+        compute_all_experiment_metrics(...)로 direct_evidence를 보강한 뒤,
+        self._last_hooks_data / self._last_direct에 저장합니다.
         """
         tod_vec = build_test_tod_vector(self.cfg)
 
@@ -207,17 +207,16 @@ class W2Experiment(BaseExperiment):
                 self.model, self.test_loader, self.mu, self.std,
                 tod_vec=tod_vec, device=self.device,
                 collect_gate_outputs=True,
-                collect_gru_states=True,   # ★ 핵심: GRU 상태 후킹
+                collect_gru_states=True,   # ★ GRU 상태 후킹
             )
         except TypeError:
-            # 구버전 시그니처 호환
             direct = evaluate_with_direct_evidence(
                 self.model, self.test_loader, self.mu, self.std,
                 tod_vec=tod_vec, device=self.device,
                 collect_gate_outputs=True,
             )
 
-        # 2) hooks_data 구성: 내부 hooks + 루트에 실려온 동등 키 흡수
+        # 2) hooks_data 구성
         hooks_data: Dict[str, Any] = {}
         w2_hooks = direct.pop("hooks_data", None)
         if isinstance(w2_hooks, dict) and len(w2_hooks) > 0:
@@ -227,7 +226,7 @@ class W2Experiment(BaseExperiment):
             if k in direct and k not in hooks_data:
                 hooks_data[k] = direct[k]
 
-        # 3) 실험 공통 지표 계산(있으면 direct 병합)
+        # 3) 실험 공통 지표 병합(있으면)
         try:
             exp_specific = compute_all_experiment_metrics(
                 experiment_type=self.experiment_type,
@@ -243,7 +242,7 @@ class W2Experiment(BaseExperiment):
         except ImportError:
             pass
 
-        # 4) 캐싱(사후 저장/그림 단계에서 사용)
+        # 4) 캐싱
         self._plotting_payload = {}
         self._last_hooks_data = copy.deepcopy(hooks_data)
         self._last_direct = copy.deepcopy(direct)
@@ -265,95 +264,79 @@ class W2Experiment(BaseExperiment):
         mae_real  = float(direct.get("mae") or direct.get("mae_real", np.nan))
         forest_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "forest_plot"
         forest_dir.mkdir(parents=True, exist_ok=True)
-        save_w2_forest_detail_row({**ctx_base, "plot_type": "forest_plot"},
-                                  rmse_real=rmse_real, mae_real=mae_real,
-                                  detail_csv=forest_dir / "forest_plot_detail.csv")
-
-        # 2) Gate raw → 보조 요약 & 그림 저장
-        gates_by_stage, gates_all = self._extract_gate_raw(hooks)
-        tod_bins = infer_tod_bins_by_dataset(dataset)
-        max_T = max(
-            len(gates_by_stage.get("S", [])) if isinstance(gates_by_stage.get("S", []), (list,np.ndarray)) else 0,
-            len(gates_by_stage.get("M", [])) if isinstance(gates_by_stage.get("M", []), (list,np.ndarray)) else 0,
-            len(gates_by_stage.get("D", [])) if isinstance(gates_by_stage.get("D", []), (list,np.ndarray)) else 0,
-            tod_bins,
+        save_w2_forest_detail_row(
+            {**ctx_base, "plot_type": "forest_plot"},
+            rmse_real=rmse_real, mae_real=mae_real,
+            detail_csv=forest_dir / "forest_plot_detail.csv"
         )
-        if max_T <= 0: max_T = tod_bins
-        tod_labels = list(range(max_T))
 
-        gate_metrics: Dict[str, Any] = {}
-        if gates_by_stage or gates_all.size > 0:
-            gate_metrics = package_w2_gate_metrics(
-                gates_by_stage=gates_by_stage,
-                gates_all=gates_all if gates_all.size > 0 else np.zeros((max_T,), dtype=float),
-                dataset=dataset,
-                tod_labels=tod_labels,
-            )
-
-        if any(k in gate_metrics for k in ["gate_tod_mean_s","gate_tod_mean_m","gate_tod_mean_d"]):
-            tod_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_tod_heatmap"
-            tod_dir.mkdir(parents=True, exist_ok=True)
-            save_w2_gate_tod_heatmap({**ctx_base, "plot_type":"gate_tod_heatmap"},
-                                     gate_metrics, out_dir=tod_dir, amp_method="range")
-
-        if any(k in gate_metrics for k in ["gate_mean","gate_std","gate_entropy","gate_sparsity","gate_kurtosis","w2_gate_variability_time"]):
-            dist_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_distribution"
-            dist_dir.mkdir(parents=True, exist_ok=True)
-            save_w2_gate_distribution({**ctx_base, "plot_type":"gate_distribution"},
-                                      gate_metrics, out_dir=dist_dir)
-
-        # 3) gate 요약 스칼라(분위수 등)
-        gate_mean    = float(gate_metrics.get("gate_mean", np.nan))
-        gate_std     = float(gate_metrics.get("gate_std", np.nan))
-        gate_entropy = float(gate_metrics.get("gate_entropy", np.nan))
-        gate_sparsity = float(gate_metrics.get("gate_sparsity", np.nan)) if "gate_sparsity" in gate_metrics else np.nan
-
-        def _safe_mean_key(k):
-            v = gate_metrics.get(k, None)
-            try:    return float(np.nanmean(np.asarray(v, dtype=float))) if v is not None else np.nan
-            except: return np.nan
-
-        gate_tod_mean_s = _safe_mean_key("gate_tod_mean_s")
-        gate_tod_mean_m = _safe_mean_key("gate_tod_mean_m")
-        gate_tod_mean_d = _safe_mean_key("gate_tod_mean_d")
-
-        tod_amp_mean = np.nan
-        amps = []
-        for k in ["gate_tod_mean_s","gate_tod_mean_m","gate_tod_mean_d"]:
-            if k in gate_metrics and gate_metrics[k] is not None:
-                amps.append(_amp_range(gate_metrics[k]))
-        if len([a for a in amps if np.isfinite(a)]) > 0:
-            tod_amp_mean = float(np.nanmean([a for a in amps if np.isfinite(a)]))
-
-        gate_q10 = gate_q50 = gate_q90 = gate_hist10 = np.nan
-        if gates_all.size > 0 and np.isfinite(gates_all).any():
-            finite = gates_all[np.isfinite(gates_all)]
-            if finite.size >= 5:
-                gate_q10, gate_q50, gate_q90 = np.quantile(finite, [0.10,0.50,0.90]).tolist()
-                gate_hist10 = float((finite > gate_q90).mean())
-
-        # 4) W2 전용 스칼라 계산 (hooks + tod_vec + direct_evidence)
+        # 2) Gate 요약 및 그림
+        gates_by_stage, gates_all = self._extract_gate_raw(hooks)
         try:
             tod_vec = build_test_tod_vector(self.cfg)
         except Exception:
             tod_vec = None
 
-        try:
-            w2m = compute_w2_metrics(
-                self.model,
-                hooks_data=hooks,
-                tod_vec=tod_vec,
-                direct_evidence=direct
+        gate_metrics: Dict[str, Any] = {}
+        if gates_by_stage or (isinstance(gates_all, np.ndarray) and gates_all.size > 0):
+            gate_metrics = package_w2_gate_metrics(
+                gates_by_stage=gates_by_stage,
+                gates_all=gates_all if isinstance(gates_all, np.ndarray) else None,
+                dataset=dataset,
+                tod_labels=None,
+                tod_vec=tod_vec
             )
+
+        # 그림 저장
+        tod_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_tod_heatmap"
+        dist_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_distribution"
+        if any(k in gate_metrics for k in ["gate_tod_mean_s","gate_tod_mean_m","gate_tod_mean_d"]):
+            tod_dir.mkdir(parents=True, exist_ok=True)
+            save_w2_gate_tod_heatmap({**ctx_base, "plot_type":"gate_tod_heatmap"},
+                                    gate_metrics, out_dir=tod_dir, amp_method="range")
+        if any(k in gate_metrics for k in ["gate_mean","gate_std","gate_entropy","gate_sparsity","gate_kurtosis","w2_gate_variability_time"]):
+            dist_dir.mkdir(parents=True, exist_ok=True)
+            save_w2_gate_distribution({**ctx_base, "plot_type":"gate_distribution"},
+                                    gate_metrics, out_dir=dist_dir)
+
+        # 3) 분위수/히스토 폴백
+        gate_q10 = gate_q50 = gate_q90 = gate_hist10 = np.nan
+        if isinstance(gates_all, np.ndarray) and gates_all.size > 0 and np.isfinite(gates_all).any():
+            finite = gates_all[np.isfinite(gates_all)]
+            if finite.size >= 5:
+                gate_q10, gate_q50, gate_q90 = np.quantile(finite, [0.10,0.50,0.90]).tolist()
+                gate_hist10 = float((finite > gate_q90).mean())
+
+        # 4) W2 특화 지표(동적/정적)
+        w2m = {}
+        try:
+            w2m = compute_w2_metrics(self.model, hooks_data=hooks, tod_vec=tod_vec, direct_evidence=direct)
         except Exception:
             w2m = {}
 
-        gate_var_t = w2m.get("w2_gate_variability_time", gate_metrics.get("w2_gate_variability_time", np.nan))
-        gate_var_b = w2m.get("w2_gate_variability_sample", np.nan)
-        gate_channel_kurt     = w2m.get("w2_channel_selectivity_kurtosis", np.nan)
-        gate_channel_sparsity = w2m.get("w2_channel_selectivity_sparsity", np.nan)
+        # static 정의값: TOD/GRU 정렬은 0.0으로 강제
+        if str(mode).lower() == "static":
+            for k in ("w2_gate_tod_alignment","w2_gate_gru_state_alignment"):
+                v = w2m.get(k, np.nan)
+                if not (isinstance(v,(int,float)) and np.isfinite(v)):
+                    w2m[k] = 0.0
 
-        # 5) 결과 행 구성 + 저장
+        # 채널 선택도 별칭/폴백
+        def _pick_finite(*vals, default=np.nan):
+            for v in vals:
+                if isinstance(v, (int,float)) and np.isfinite(v):
+                    return float(v)
+            return float(default)
+
+        w2_kurt = w2m.get("w2_channel_selectivity_kurtosis", np.nan)
+        w2_spa  = w2m.get("w2_channel_selectivity_sparsity", np.nan)
+        g_kurt  = gate_metrics.get("gate_kurtosis", np.nan)
+        g_spa   = gate_metrics.get("gate_sparsity", np.nan)
+
+        gate_channel_kurt     = _pick_finite(w2_kurt, g_kurt, default=0.0)   # 보고서 호환/폴백
+        gate_channel_sparsity = _pick_finite(w2_spa,  g_spa,  default=0.0)
+
+        # 5) 결과행
         row = {
             "dataset": dataset, "horizon": horizon, "seed": seed, "mode": mode,
             "model_tag": model_tag, "experiment_type": EXP_TAG,
@@ -361,29 +344,43 @@ class W2Experiment(BaseExperiment):
             "rmse": rmse_real, "mae": mae_real,
 
             # Gate 전역 요약
-            "gate_mean": gate_mean, "gate_std": gate_std,
-            "gate_entropy": gate_entropy, "gate_sparsity": gate_sparsity,
+            "gate_mean": float(gate_metrics.get("gate_mean", np.nan)),
+            "gate_std":  float(gate_metrics.get("gate_std",  np.nan)),
+            "gate_entropy": float(gate_metrics.get("gate_entropy", np.nan)),
+            "gate_sparsity": float(gate_metrics.get("gate_sparsity", np.nan)),
             "gate_q10": gate_q10, "gate_q50": gate_q50, "gate_q90": gate_q90,
             "gate_hist10": gate_hist10,
 
             # TOD 요약
-            "gate_tod_mean_s": gate_tod_mean_s,
-            "gate_tod_mean_m": gate_tod_mean_m,
-            "gate_tod_mean_d": gate_tod_mean_d,
-            "tod_amp_mean": tod_amp_mean,
+            "gate_tod_mean_s": float(np.nanmean(gate_metrics.get("gate_tod_mean_s", [])) if isinstance(gate_metrics.get("gate_tod_mean_s"), (list,tuple,np.ndarray)) else np.nan),
+            "gate_tod_mean_m": float(np.nanmean(gate_metrics.get("gate_tod_mean_m", [])) if isinstance(gate_metrics.get("gate_tod_mean_m"), (list,tuple,np.ndarray)) else np.nan),
+            "gate_tod_mean_d": float(np.nanmean(gate_metrics.get("gate_tod_mean_d", [])) if isinstance(gate_metrics.get("gate_tod_mean_d"), (list,tuple,np.ndarray)) else np.nan),
+            "tod_amp_mean": float(np.nanmean([np.nanmax(v)-np.nanmin(v) for v in [
+                np.asarray(gate_metrics.get("gate_tod_mean_s", []), float),
+                np.asarray(gate_metrics.get("gate_tod_mean_m", []), float),
+                np.asarray(gate_metrics.get("gate_tod_mean_d", []), float)
+            ] if v.size>0 and np.isfinite(v).any()])) if any(isinstance(gate_metrics.get(k),(list,tuple,np.ndarray)) for k in ("gate_tod_mean_s","gate_tod_mean_m","gate_tod_mean_d")) else np.nan,
 
-            # W2 전용
+            # W2 전용 (그대로 주입)
             **w2m,
 
             # 별칭(보고서 호환)
-            "gate_var_t": gate_var_t,
-            "gate_var_b": gate_var_b,
+            "gate_var_t": w2m.get("w2_gate_variability_time", gate_metrics.get("w2_gate_variability_time", np.nan)),
+            "gate_var_b": w2m.get("w2_gate_variability_sample", np.nan),
             "gate_channel_kurt": gate_channel_kurt,
             "gate_channel_sparsity": gate_channel_sparsity,
         }
 
-        row = _merge_cg_gc_from_direct_evidence(row, direct)
+        # cg_*/gc_* 병합
+        for k in ("mse_std","mae_std","cg_pearson_mean","cg_spearman_mean","cg_dcor_mean",
+                "cg_event_gain","cg_event_hit","cg_maxcorr","cg_bestlag",
+                "gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2",
+                "gc_kernel_feat_dcor","gc_kernel_feat_align"):
+            if k in direct:
+                try: row[k] = float(direct[k])
+                except Exception: row[k] = direct[k]
 
+        # 저장
         results_csv = RESULTS_ROOT / f"results_{EXP_TAG}.csv"
         self._append_or_update_results(
             results_csv, row,

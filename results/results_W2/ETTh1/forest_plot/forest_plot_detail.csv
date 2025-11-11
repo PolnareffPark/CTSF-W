@@ -1,9 +1,3 @@
 experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag,rmse_real,mae_real
 W2,ETTh1,forest_plot,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,3.065161943435669,1.811998963356018
 W2,ETTh1,forest_plot,96,42,static,HyperConv,W2_ETTh1_96_42_static,3.100264072418213,1.906317949295044
-W2,ETTh1,forest_plot,192,42,dynamic,HyperConv,W2_ETTh1_192_42_dynamic,3.177674055099488,1.9250249862670896
-W2,ETTh1,forest_plot,192,42,static,HyperConv,W2_ETTh1_192_42_static,3.2016921043396,1.9680229425430296
-W2,ETTh1,forest_plot,336,42,dynamic,HyperConv,W2_ETTh1_336_42_dynamic,3.30964994430542,2.036760091781616
-W2,ETTh1,forest_plot,336,42,static,HyperConv,W2_ETTh1_336_42_static,3.284329891204834,2.022181987762451
-W2,ETTh1,forest_plot,720,42,dynamic,HyperConv,W2_ETTh1_720_42_dynamic,3.181925058364868,1.986430048942566
-W2,ETTh1,forest_plot,720,42,static,HyperConv,W2_ETTh1_720_42_static,3.296344041824341,2.0965700149536133
