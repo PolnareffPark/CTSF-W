@@ -1,194 +1,255 @@
-"""
-W3 실험: 데이터 구조 원인 확인 (교란 시험)
-"""
+# ============================================================
+# experiments/w3_experiment.py
+#   - W3: 원인 교란(perturbation) 전/후를 한 실험에서 쌍으로 평가/저장
+#   - 결과/그림: W1/W2와 동일 스키마 준수
+# ============================================================
 
-from experiments.base_experiment import BaseExperiment
-from models.ctsf_model import HybridTS
+from __future__ import annotations
+import copy, time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
+
 import numpy as np
-import torch
-from scipy.signal import savgol_filter
+import pandas as pd
 
+from .base_experiment import BaseExperiment
+from data.dataset import build_test_tod_vector
+from utils.direct_evidence import evaluate_with_direct_evidence
+from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
+from utils.experiment_metrics.w3_metrics import (
+    compute_w3_single_metrics, compute_w3_pair_metrics
+)
 
-def get_dataset_freq_minutes(dataset_name):
-    """
-    데이터셋별 시간 간격(분) 반환
-    - ETTh: 60분 (1시간)
-    - ETTm: 15분
-    - weather: 10분
-    """
-    dataset_name = dataset_name.lower()
-    if 'etth' in dataset_name:
-        return 60
-    elif 'ettm' in dataset_name:
-        return 15
-    elif 'weather' in dataset_name:
-        return 10
-    else:
-        # 기본값 (ETTm과 동일)
-        return 15
+from utils.experiment_plotting_metrics.w3_plotting_metrics import (
+    save_w3_forest_detail_row,
+    rebuild_w3_forest_summary,
+    save_w3_perturb_delta_bar,
+)
 
+RESULTS_ROOT = Path("results")
+EXP_TAG = "W3"
 
-class PerturbedDataLoader:
-    """교란된 데이터를 제공하는 DataLoader 래퍼"""
-    def __init__(self, original_loader, perturbation_type, dataset_name, **kwargs):
-        self.original_loader = original_loader
-        self.perturbation_type = perturbation_type
-        self.dataset_name = dataset_name
-        self.kwargs = kwargs
-        
-        # 데이터셋별 시간 간격에 맞춰 시프트 포인트 계산
-        self.freq_minutes = get_dataset_freq_minutes(dataset_name)
-        # 기본 시프트: 1시간 분량
-        self.default_shift_hours = 1
-        self.default_shift_points = (self.default_shift_hours * 60) // self.freq_minutes
-    
-    def __iter__(self):
-        for xb, yb in self.original_loader:
-            # 배치별로 교란 적용
-            if self.perturbation_type == 'tod_shift':
-                # 시간대 시프트는 배치 단위로 랜덤 적용
-                xb_np = xb.cpu().numpy()
-                B, C, L = xb_np.shape
-                # 데이터셋별 시간 간격에 맞춰 시프트 포인트 계산
-                shift_points = self.kwargs.get('shift_points', self.default_shift_points)
-                for i in range(B):
-                    shift = np.random.randint(-shift_points, shift_points + 1)
-                    xb_np[i] = np.roll(xb_np[i], shift, axis=1)
-                xb = torch.from_numpy(xb_np).to(xb.device)
-            elif self.perturbation_type == 'smooth':
-                # 평활화: Savitzky-Golay 필터 적용
-                xb_np = xb.cpu().numpy()
-                window = self.kwargs.get('window_length', 5)
-                poly = self.kwargs.get('polyorder', 2)
-                for i in range(xb_np.shape[0]):
-                    for c in range(xb_np.shape[1]):
-                        xb_np[i, c] = savgol_filter(xb_np[i, c], window, poly, mode='nearest')
-                xb = torch.from_numpy(xb_np).to(xb.device)
-            yield xb, yb
-    
-    def __len__(self):
-        return len(self.original_loader)
+_W3_KEYS = [
+    "experiment_type","dataset","plot_type","horizon","seed","mode","model_tag",
+    "run_tag","perturb_type","condition"  # 'baseline' or 'perturbed'
+]
 
+def _ensure_dir(p: str | Path) -> Path:
+    p = Path(p); p.parent.mkdir(parents=True, exist_ok=True); return p
+
+def _atomic_write_csv(df: pd.DataFrame, path: str | Path) -> None:
+    path = _ensure_dir(path)
+    tmp = path.with_suffix(path.suffix + f".tmp{int(time.time()*1000)}")
+    df.to_csv(tmp, index=False); tmp.replace(path)
 
 class W3Experiment(BaseExperiment):
-    """W3 실험: 데이터 교란"""
-    
-    def __init__(self, cfg):
-        # 교란 설정 저장
-        self.perturbation = cfg.get("perturbation")
-        self.perturbation_kwargs = cfg.get("perturbation_kwargs", {})
-        super().__init__(cfg)
-        
-        # W3 실험은 동일한 모델(교란 없이 학습)로 테스트 데이터에만 교란 적용
-        # 따라서 학습 데이터에는 교란을 적용하지 않음
-    
-    def _create_model(self):
-        # 기본 모델 사용
-        model = HybridTS(self.cfg, self.n_vars)
-        model.set_cross_directions(use_gc=True, use_cg=True)
-        return model
-    
-    def _get_run_tag(self):
-        perturbation = self.cfg.get("perturbation", "none")
-        return f"{self.dataset_tag}-h{self.cfg['horizon']}-s{self.cfg['seed']}-W3-{perturbation}"
-    
-    def evaluate_test(self):
+    """
+    - 한 번의 run 안에서 baseline → perturbed(예: 'tod_shuffle', 'peak_weakening') 순서로 평가
+    - 각 조건의 결과를 results_W3.csv 에 기록
+    - perturbed 행에는 baseline 대비 Δ지표를 병합하여 기록
+    - Forest raw(detail) 2행 저장 → summary 재작성
+    """
+    def __init__(self, cfg: Dict[str, Any]):
+        cfg_local = copy.deepcopy(cfg or {})
+        cfg_local.setdefault("experiment_type", EXP_TAG)
+        super().__init__(cfg_local)
+        self._last_hooks: Dict[str, Any] = {}
+        self._last_direct: Dict[str, Any] = {}
+
+    # ------------------------------
+    # 컨텍스트/도우미
+    # ------------------------------
+    def _ctx(self, dataset: str, horizon: int, seed: int, mode: str,
+             model_tag: str, run_tag: str, perturb_type: str, condition: str,
+             plot_type: str = "") -> Dict[str,Any]:
+        return {
+            "experiment_type": EXP_TAG,
+            "dataset": dataset,
+            "plot_type": plot_type,
+            "horizon": int(horizon),
+            "seed": int(seed),
+            "mode": str(mode),
+            "model_tag": str(model_tag),
+            "run_tag": str(run_tag),
+            "perturb_type": str(perturb_type),
+            "condition": str(condition),
+        }
+
+    def _append_or_update_results(self, csv_path: Path, row: Dict[str,Any], subset: List[str]) -> None:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        new = pd.DataFrame([row])
+        if csv_path.exists():
+            old = pd.read_csv(csv_path)
+            for c in new.columns:
+                if c not in old.columns: old[c] = np.nan
+            for c in old.columns:
+                if c not in new.columns: new[c] = np.nan
+            df = pd.concat([old, new], ignore_index=True)
+            df.drop_duplicates(subset=subset, keep="last", inplace=True)
+            tmp = csv_path.with_suffix(".csv.tmp")
+            df.to_csv(tmp, index=False); tmp.replace(csv_path)
+        else:
+            new.to_csv(csv_path, index=False)
+
+    # ------------------------------
+    # 평가: 한 조건(baseline/perturbed)
+    # ------------------------------
+    def _evaluate_condition(
+        self,
+        condition: str,                     # 'baseline' or 'perturbed'
+        perturb_type: Optional[str],        # None or 'tod_shuffle'/'peak_weakening'/...
+    ) -> Tuple[Dict[str,Any], Dict[str,Any]]:
         """
-        W3 실험용 테스트 평가: baseline(교란 없음)과 교란 실험 모두 수행하여 비교
+        evaluate_with_direct_evidence 호출 시, perturbed이면 perturbation_type을 전달.
+        direct + hooks_data 반환.
         """
-        from data.dataset import build_test_tod_vector
-        from utils.direct_evidence import evaluate_with_direct_evidence
-        from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
-        
         tod_vec = build_test_tod_vector(self.cfg)
-        collect_gates = False  # W3는 게이트 수집 불필요
-        
-        # 교란이 "none"이면 baseline 자체이므로 일반 평가만 수행
-        if self.perturbation == "none":
+        kwargs = dict(
+            model=self.model,
+            data_loader=self.test_loader,
+            mu=self.mu, std=self.std,
+            tod_vec=tod_vec,
+            device=self.device,
+            collect_gate_outputs=True,
+        )
+        try:
+            # 새 시그니처(키워드명 다를 수 있어 kwargs로 안전 전달)
             direct = evaluate_with_direct_evidence(
                 self.model, self.test_loader, self.mu, self.std,
                 tod_vec=tod_vec, device=self.device,
-                collect_gate_outputs=collect_gates
+                collect_gate_outputs=True,
+                perturbation_type=perturb_type if condition=="perturbed" else None
             )
-            
-            # W3 지표는 비교가 필요하므로 baseline 자체에서는 계산하지 않음
-            # win_errors는 CSV 저장 시 제외
-            direct.pop('hooks_data', None)
-            direct.pop('win_errors', None)  # 벡터는 CSV에 저장 불가
-            
-            return direct
-        
-        # 교란이 있는 경우: baseline(교란 없음)과 교란 실험 모두 수행
-        # 1. Baseline 평가 (교란 없이)
-        # 원본 test_loader를 사용 (PerturbedDataLoader가 아닌 원본)
-        from data.dataset import load_split_dataloaders
-        
-        # 원본 데이터로더를 다시 생성 (교란 없이)
-        cfg_baseline = self.cfg.copy()
-        cfg_baseline["perturbation"] = "none"
-        _, _, test_loader_baseline, _ = load_split_dataloaders(cfg_baseline)
-        
-        # verbose 모드일 때만 출력
-        if self.cfg.get("verbose", True):
-            print(f"[W3] Evaluating baseline (no perturbation)...")
-        baseline_direct = evaluate_with_direct_evidence(
-            self.model, test_loader_baseline, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device,
-            collect_gate_outputs=collect_gates
-        )
-        
-        # hooks_data와 win_errors 제거 (metrics 계산용으로만 사용)
-        baseline_direct.pop('hooks_data', None)
-        
-        # 2. 교란 평가
-        if self.cfg.get("verbose", True):
-            print(f"[W3] Evaluating with perturbation: {self.perturbation}...")
-        
-        # 교란된 test_loader 생성
-        test_loader_perturbed = PerturbedDataLoader(
-            test_loader_baseline, self.perturbation, self.dataset_tag, **self.perturbation_kwargs
-        )
-        
-        current_direct = evaluate_with_direct_evidence(
-            self.model, test_loader_perturbed, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device,
-            collect_gate_outputs=collect_gates
-        )
-        
-        # hooks_data 제거
-        current_direct.pop('hooks_data', None)
-        
-        # 3. W3 특화 지표 계산 (baseline_metrics와 perturb_metrics 전달)
-        # win_errors는 baseline_direct와 current_direct에 포함되어 있음
-        exp_specific = compute_all_experiment_metrics(
-            experiment_type=self.experiment_type,
-            model=self.model,
-            hooks_data=None,
-            tod_vec=tod_vec,
-            perturbation_type=self.perturbation,
-            baseline_metrics=baseline_direct.copy(),  # 복사본 전달 (pop으로 변경되므로)
-            perturb_metrics=current_direct.copy(),    # 복사본 전달
-            w3_dz_ci=self.cfg.get("w3_dz_ci", False), # 선택적 부트스트랩 CI
-            active_layers=[],
-        )
-        
-        # 4. win_errors 제거 (벡터는 CSV에 저장 불가)
-        current_direct.pop('win_errors', None)
-        
-        # 5. W3 지표 통합
-        for k, v in exp_specific.items():
-            current_direct[k] = v
-        
-        # 6. 출력 (verbose 모드일 때만)
-        if self.cfg.get("verbose", True):
-            print(f"[W3] Baseline RMSE: {baseline_direct['rmse']:.4f}, Perturbed RMSE: {current_direct['rmse']:.4f}")
-            if 'w3_intervention_effect_rmse' in exp_specific:
-                print(f"[W3] Intervention effect (ΔRMSE%): {exp_specific['w3_intervention_effect_rmse']*100:.2f}%")
-            if 'w3_intervention_cohens_d' in exp_specific:
-                print(f"[W3] Cohen's d_z: {exp_specific['w3_intervention_cohens_d']:.4f}")
-            if 'w3_rank_preservation_rate' in exp_specific:
-                print(f"[W3] Rank preservation (교란>기준): {exp_specific['w3_rank_preservation_rate']*100:.1f}%")
-            if 'w3_lag_distribution_change' in exp_specific:
-                print(f"[W3] Lag distribution change: {exp_specific['w3_lag_distribution_change']:.4f}")
-        
-        return current_direct
+        except TypeError:
+            # 구버전 시그니처 호환(perturbation_type 미지원)
+            direct = evaluate_with_direct_evidence(**kwargs)
+
+        hooks_data: Dict[str,Any] = {}
+        w_hooks = direct.pop("hooks_data", None)
+        if isinstance(w_hooks, dict) and len(w_hooks)>0:
+            hooks_data.update(w_hooks)
+
+        # 공통 추가 지표(있는 경우에만): W1/W2와 동일 호출 패턴
+        try:
+            extra = compute_all_experiment_metrics(
+                experiment_type=self.experiment_type,
+                model=self.model,
+                hooks_data=hooks_data if hooks_data else None,
+                tod_vec=tod_vec,
+                direct_evidence=direct,
+                perturbation_type=perturb_type if condition=="perturbed" else None,
+                active_layers=[]
+            )
+            if isinstance(extra, dict):
+                direct.update(extra)
+        except ImportError:
+            pass
+
+        # 단일 조건 보조(게이트 분포)
+        try:
+            single = compute_w3_single_metrics(hooks_data)
+            if isinstance(single, dict):
+                direct.update(single)
+        except Exception:
+            pass
+
+        return direct, hooks_data
+
+    # ------------------------------
+    # 저장: 한 조건(baseline/perturbed)
+    # ------------------------------
+    def _save_condition(
+        self,
+        dataset: str, horizon: int, seed: int, mode: str, model_tag: str,
+        perturb_type: str, condition: str, direct: Dict[str,Any], hooks: Dict[str,Any]
+    ) -> Dict[str,Any]:
+        run_tag = f"{EXP_TAG}_{dataset}_{horizon}_{seed}_{mode}_{condition}_{perturb_type}"
+        ctx = self._ctx(dataset, horizon, seed, mode, model_tag, run_tag, perturb_type, condition)
+
+        rmse_real = float(direct.get("rmse") or np.sqrt(float(direct.get("mse_real", np.nan))))
+        mae_real  = float(direct.get("mae") or direct.get("mae_real", np.nan))
+
+        # Forest raw(detail)
+        fdir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "forest_plot"
+        fdir.mkdir(parents=True, exist_ok=True)
+        save_w3_forest_detail_row({**ctx, "plot_type": "forest_plot"}, rmse_real=rmse_real, mae_real=mae_real,
+                                  detail_csv=fdir/"forest_plot_detail.csv")
+
+        # results_W3.csv 1행 저장
+        row = {
+            "experiment_type": EXP_TAG,
+            "dataset": dataset, "horizon": int(horizon), "seed": int(seed),
+            "mode": mode, "model_tag": model_tag, "perturb_type": perturb_type, "condition": condition,
+            "mse_real": float(direct.get("mse_real", np.nan)),
+            "rmse": rmse_real, "mae": mae_real,
+            # 보조 통계(있으면)
+            "gate_mean": float(direct.get("gate_mean", np.nan)),
+            "gate_std":  float(direct.get("gate_std",  np.nan)),
+            "gate_entropy": float(direct.get("gate_entropy", np.nan)),
+            "gate_kurtosis": float(direct.get("gate_kurtosis", np.nan)),
+            "gate_sparsity": float(direct.get("gate_sparsity", np.nan)),
+        }
+        res_csv = RESULTS_ROOT / f"results_{EXP_TAG}.csv"
+        self._append_or_update_results(res_csv, row,
+            subset=["experiment_type","dataset","horizon","seed","mode","model_tag","perturb_type","condition"])
+        return row
+
+    # ------------------------------
+    # 메인 엔트리
+    # ------------------------------
+    def run(self) -> bool:
+        try:
+            self.train()
+
+            dataset = str(getattr(self, "dataset_tag", self.cfg.get("dataset", self.cfg.get("dataset_tag","Unknown"))))
+            horizon = int(self.cfg.get("horizon", self.cfg.get("pred_len", 96)))
+            seed    = int(self.cfg.get("seed", 42))
+            mode    = str(self.cfg.get("mode", "dynamic"))
+            model_tag = str(self.cfg.get("model_tag", getattr(self.model, "model_tag", "HyperConv")))
+            perturb  = str(self.cfg.get("perturbation", "tod_shuffle"))  # 예: 'tod_shuffle' | 'peak_weakening' 등
+
+            # 1) baseline
+            base_direct, base_hooks = self._evaluate_condition(condition="baseline",  perturb_type=None)
+            base_row = self._save_condition(dataset, horizon, seed, mode, model_tag, perturb, "baseline", base_direct, base_hooks)
+
+            # 2) perturbed
+            pert_direct, pert_hooks = self._evaluate_condition(condition="perturbed", perturb_type=perturb)
+            pert_row = self._save_condition(dataset, horizon, seed, mode, model_tag, perturb, "perturbed", pert_direct, pert_hooks)
+
+            # 3) Δ지표 계산 → perturbed 행 갱신(merge)
+            tod_vec = build_test_tod_vector(self.cfg)
+            pair = compute_w3_pair_metrics(base_direct, pert_direct, base_hooks, pert_hooks, tod_vec)
+            if isinstance(pair, dict):
+                # results_W3.csv 의 perturbed 행을 Δ로 보강
+                res_csv = RESULTS_ROOT / f"results_{EXP_TAG}.csv"
+                row = {
+                    **pert_row,
+                    **{k: float(v) if v is not None else np.nan for k,v in pair.items()}
+                }
+                self._append_or_update_results(
+                    res_csv, row,
+                    subset=["experiment_type","dataset","horizon","seed","mode","model_tag","perturb_type","condition"]
+                )
+
+                # Perturb ΔBar 저장
+                pdir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "perturb_delta_bar"
+                pdir.mkdir(parents=True, exist_ok=True)
+                ctx_bar = {
+                    "experiment_type": EXP_TAG, "dataset": dataset, "plot_type": "perturb_delta_bar",
+                    "horizon": horizon, "seed": seed, "mode": mode, "model_tag": model_tag,
+                    "run_tag": f"{EXP_TAG}_{dataset}_{horizon}_{seed}_{mode}_PAIR_{perturb}",
+                    "perturb_type": perturb, "condition": "pair"
+                }
+                save_w3_perturb_delta_bar(ctx_bar, pair, out_dir=pdir)
+
+            # 4) Forest summary 재작성
+            fdir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "forest_plot"
+            rebuild_w3_forest_summary(
+                detail_csv=fdir/"forest_plot_detail.csv",
+                summary_csv=fdir/"forest_plot_summary.csv",
+                per_cond="perturbed", last_cond="baseline",
+                group_keys=("experiment_type","dataset","horizon","perturb_type")
+            )
+            return True
+        finally:
+            self.cleanup()

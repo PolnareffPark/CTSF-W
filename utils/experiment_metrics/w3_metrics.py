@@ -1,186 +1,232 @@
-"""
-W3 실험 특화 지표: 데이터 교란 효과
-"""
+# ============================================================
+# utils/experiment_metrics/w3_metrics.py
+#   - W3: 원인 교란(perturbation) 전/후 쌍 비교 지표 + 단일 조건 보조 통계
+#   - W1/W2 의존성 없음. (utils.metrics._dcor_u 사용 가능)
+# ============================================================
 
+from __future__ import annotations
+from typing import Dict, Optional, Tuple
 import numpy as np
-from typing import Dict, Optional
+from scipy import stats
 
+try:
+    # 존재 시 거리상관 사용(W2와 동일 경로)
+    from utils.metrics import _dcor_u  # optional
+except Exception:
+    _dcor_u = None  # 폴백: None이면 TOD 정렬 Δ는 NaN
 
-def _safe_div(a, b, eps=1e-12):
-    """안전한 나눗셈"""
-    return a / (b + eps)
+# ---------- 내부 유틸 ----------
+def _as_np(a):
+    try:
+        if hasattr(a, "detach"):
+            a = a.detach().cpu().numpy()
+        return np.asarray(a)
+    except Exception:
+        return None
 
+def _safe_entropy(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x) & (x > 1e-12)]
+    if x.size == 0:
+        return float("nan")
+    p = x / (x.sum() + 1e-12)
+    return float(-np.sum(p * np.log(p + 1e-12)))
 
-def paired_cohens_dz(diff_vec: np.ndarray) -> float:
+def _safe_kurtosis(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("nan")
+    if np.allclose(x, x[0]):
+        return 0.0
+    try:
+        return float(stats.kurtosis(x, fisher=True, bias=False, nan_policy="omit"))
+    except Exception:
+        return float("nan")
+
+def _hoyer_sparsity(x: np.ndarray) -> float:
+    x = np.abs(np.asarray(x, float))
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n == 0:
+        return float("nan")
+    l1 = float(np.sum(x))
+    l2 = float(np.linalg.norm(x))
+    if l2 == 0.0:
+        return 0.0
+    return float((np.sqrt(n) - l1 / l2) / (np.sqrt(n) - 1.0 + 1e-12))
+
+def _concat_gate_per_sample(hooks: Optional[Dict]) -> Optional[np.ndarray]:
     """
-    Paired Cohen's d_z = mean(diff) / std(diff), ddof=1
-    
-    Args:
-        diff_vec: (N,) 윈도우별 오차 차이 = perturbed - baseline
-    
-    Returns:
-        Cohen's d_z 값
+    hooks에서 gate_outputs를 (N,L,G) 또는 (N,...) 형태로 연결해 (N, -1) 강도 벡터를 반환.
+    수집 실패 시 None.
     """
-    diff_vec = np.asarray(diff_vec, dtype=np.float64)
-    if diff_vec.ndim != 1 or diff_vec.size < 2:
-        return np.nan
-    
-    mu = np.mean(diff_vec)
-    sd = np.std(diff_vec, ddof=1)
-    
-    if not np.isfinite(sd) or sd <= 0:
-        return np.nan
-    
-    return float(mu / sd)
+    if not isinstance(hooks, dict):
+        return None
+    src = None
+    if "gate_outputs" in hooks and hooks["gate_outputs"]:
+        bags = []
+        for a in hooks["gate_outputs"]:
+            a = _as_np(a)
+            if a is None:
+                continue
+            a = np.asarray(a, float)
+            if a.ndim >= 2:
+                bags.append(a.reshape(a.shape[0], -1))
+            else:
+                bags.append(a.reshape(-1, 1))
+        if bags:
+            try:
+                src = np.concatenate(bags, axis=0)  # (N, F)
+            except Exception:
+                src = bags[0]
+    # stage dict만 있는 경우 평균으로 근사
+    if src is None:
+        for k in ("gates_by_stage", "gate_by_stage", "gate_logs_by_stage"):
+            if k in hooks and isinstance(hooks[k], dict) and hooks[k]:
+                arrs = []
+                for s in ("S","M","D","s","m","d"):
+                    if s in hooks[k] and hooks[k][s] is not None:
+                        a = _as_np(hooks[k][s])
+                        if a is not None:
+                            a = np.asarray(a, float)
+                            arrs.append(a.reshape(a.shape[0], -1) if a.ndim >= 2 else a.reshape(-1,1))
+                if arrs:
+                    try:
+                        src = np.concatenate(arrs, axis=1)  # (N, F)
+                    except Exception:
+                        src = arrs[0]
+                break
+    return src  # (N,F) or None
 
-
-def bootstrap_ci(stat_fn, data, n_boot=500, ci=95, rng=None):
+def _tod_align_strength(gate_F: Optional[np.ndarray], tod_vec: Optional[np.ndarray]) -> float:
     """
-    부트스트랩 신뢰구간 계산 (선택적)
-    
-    Args:
-        stat_fn: data -> scalar 함수 (예: lambda x: np.mean(x)/np.std(x, ddof=1))
-        data: 1D array
-        n_boot: 부트스트랩 반복 횟수
-        ci: 신뢰구간 퍼센트 (기본 95%)
-        rng: 난수 생성기
-    
-    Returns:
-        (lower, upper) 신뢰구간
+    gate_F: (N,F) → N별 강도 스칼라로 요약(mean) 후 TOD(sin,cos)와 거리상관.
     """
-    if rng is None:
-        rng = np.random.default_rng(0)
-    
-    data = np.asarray(data)
-    if data.ndim != 1 or data.size < 2:
-        return (np.nan, np.nan)
-    
-    stats = []
-    n = data.size
-    for _ in range(n_boot):
-        idx = rng.integers(0, n, size=n)
-        stats.append(stat_fn(data[idx]))
-    
-    lo = (100 - ci) / 2.0
-    hi = 100 - lo
-    return (float(np.nanpercentile(stats, lo)), float(np.nanpercentile(stats, hi)))
-
-
-def compute_w3_metrics(
-    baseline_metrics: Dict,
-    perturb_metrics: Dict,
-    win_errors_base: Optional[np.ndarray] = None,
-    win_errors_pert: Optional[np.ndarray] = None,
-    *,
-    dz_ci: bool = False,
-    **kwargs
-) -> Dict:
-    """
-    W3 특화 지표 계산
-    
-    Args:
-        baseline_metrics: baseline 스칼라 지표 {'rmse', 'gc_kernel_tod_dcor', 'cg_event_gain', ...}
-        perturb_metrics: 교란 스칼라 지표
-        win_errors_base: 테스트셋 윈도우별 오차 벡터 (N,) - baseline
-        win_errors_pert: 테스트셋 윈도우별 오차 벡터 (N,) - perturbed
-        dz_ci: True면 부트스트랩 CI 계산
-    
-    Returns:
-        dict with keys:
-        - w3_rmse_base, w3_rmse_perturb: 원본 RMSE 값
-        - w3_tod_sens_base, w3_tod_sens_perturb: 원본 TOD 민감도
-        - w3_peak_resp_base, w3_peak_resp_perturb: 원본 피크 반응
-        - w3_intervention_effect_rmse: ΔRMSE (상대 변화율)
-        - w3_intervention_effect_tod: ΔTOD (절대 차이)
-        - w3_intervention_effect_peak: ΔPeak (절대 차이)
-        - w3_intervention_cohens_d: Paired Cohen's d_z
-        - w3_rank_preservation_rate: P(perturbed > baseline) - 순위 보존률
-        - w3_lag_distribution_change: 라그 분포 변화
-        - w3_cohens_d_ci_low, w3_cohens_d_ci_high: CI (선택적)
-    """
-    out = {}
-    
-    # 1) RMSE: 원본 값 저장 + 상대 변화율 계산
-    rmse_b = float(baseline_metrics.get('rmse', np.nan))
-    rmse_p = float(perturb_metrics.get('rmse', np.nan))
-    
-    out['w3_rmse_base'] = rmse_b
-    out['w3_rmse_perturb'] = rmse_p
-    
-    if np.isfinite(rmse_b) and rmse_b > 0 and np.isfinite(rmse_p):
-        out['w3_intervention_effect_rmse'] = _safe_div((rmse_p - rmse_b), rmse_b)
-    else:
-        out['w3_intervention_effect_rmse'] = np.nan
-    
-    # 2) TOD 민감도: 원본 값 저장 + 절대 차이 계산
-    tod_b = float(baseline_metrics.get('gc_kernel_tod_dcor', np.nan))
-    tod_p = float(perturb_metrics.get('gc_kernel_tod_dcor', np.nan))
-    
-    out['w3_tod_sens_base'] = tod_b
-    out['w3_tod_sens_perturb'] = tod_p
-    
-    if np.isfinite(tod_b) and np.isfinite(tod_p):
-        out['w3_intervention_effect_tod'] = tod_p - tod_b
-    else:
-        out['w3_intervention_effect_tod'] = np.nan
-    
-    # 3) 피크 반응: 원본 값 저장 + 절대 차이 계산
-    peak_b = float(baseline_metrics.get('cg_event_gain', np.nan))
-    peak_p = float(perturb_metrics.get('cg_event_gain', np.nan))
-    
-    out['w3_peak_resp_base'] = peak_b
-    out['w3_peak_resp_perturb'] = peak_p
-    
-    if np.isfinite(peak_b) and np.isfinite(peak_p):
-        out['w3_intervention_effect_peak'] = peak_p - peak_b
-    else:
-        out['w3_intervention_effect_peak'] = np.nan
-    
-    # 4) Paired Cohen's d_z (윈도우별 오차 벡터 사용)
-    if win_errors_base is not None and win_errors_pert is not None:
-        win_errors_base = np.asarray(win_errors_base).reshape(-1)
-        win_errors_pert = np.asarray(win_errors_pert).reshape(-1)
-        
-        if win_errors_base.size >= 2 and win_errors_base.size == win_errors_pert.size:
-            diff = win_errors_pert - win_errors_base
-            dz = paired_cohens_dz(diff)
-            out['w3_intervention_cohens_d'] = dz
-            
-            # 순위 보존률: P(perturbed > baseline) = 교란으로 악화된 비율
-            out['w3_rank_preservation_rate'] = float(np.mean(win_errors_pert > win_errors_base))
-            
-            # 선택적 부트스트랩 CI
-            if dz_ci:
-                lo, hi = bootstrap_ci(
-                    lambda x: np.mean(x) / np.std(x, ddof=1) if np.std(x, ddof=1) > 0 else np.nan,
-                    diff,
-                    n_boot=500,
-                    ci=95
-                )
-                out['w3_cohens_d_ci_low'] = lo
-                out['w3_cohens_d_ci_high'] = hi
+    if _dcor_u is None or gate_F is None or tod_vec is None:
+        return float("nan")
+    try:
+        if tod_vec.ndim == 1:
+            ty = tod_vec.reshape(-1, 1)
         else:
-            out['w3_intervention_cohens_d'] = np.nan
-            out['w3_rank_preservation_rate'] = np.nan
-            if dz_ci:
-                out['w3_cohens_d_ci_low'] = np.nan
-                out['w3_cohens_d_ci_high'] = np.nan
-    else:
-        # 윈도우별 오차가 없으면 NaN
-        out['w3_intervention_cohens_d'] = np.nan
-        out['w3_rank_preservation_rate'] = np.nan
-        if dz_ci:
-            out['w3_cohens_d_ci_low'] = np.nan
-            out['w3_cohens_d_ci_high'] = np.nan
-    
-    # 5) 라그 분포 변화: baseline과 perturbed의 cg_bestlag 비교
-    bestlag_b = baseline_metrics.get('cg_bestlag', np.nan)
-    bestlag_p = perturb_metrics.get('cg_bestlag', np.nan)
-    
-    if np.isfinite(bestlag_b) and np.isfinite(bestlag_p):
-        # 단일 스칼라 값인 경우: 절대 차이
-        out['w3_lag_distribution_change'] = float(abs(bestlag_p - bestlag_b))
-    else:
-        out['w3_lag_distribution_change'] = np.nan
-    
+            ty = tod_vec.reshape(len(tod_vec), -1)
+        g_strength = np.nanmean(gate_F, axis=1).reshape(-1, 1)  # (N,1)
+        L = min(g_strength.shape[0], ty.shape[0])
+        if L < 3:
+            return float("nan")
+        return float(_dcor_u(g_strength[:L], ty[:L]))
+    except Exception:
+        return float("nan")
+
+# ---------- 단일 조건 보조 통계 ----------
+def compute_w3_single_metrics(
+    hooks_data: Optional[Dict] = None
+) -> Dict[str, float]:
+    """
+    게이트 분포 보조 통계 (있으면 기록, 없으면 NaN).
+    - gate_mean, gate_std, gate_entropy, gate_kurtosis, gate_sparsity
+    - gate_q05, q10, q25, q50, q75, q90, q95
+    """
+    m = {
+        "gate_mean": float("nan"),
+        "gate_std": float("nan"),
+        "gate_entropy": float("nan"),
+        "gate_kurtosis": float("nan"),
+        "gate_sparsity": float("nan"),
+    }
+    q_keys = ["gate_q05","gate_q10","gate_q25","gate_q50","gate_q75","gate_q90","gate_q95"]
+    for k in q_keys:
+        m[k] = float("nan")
+
+    G = _concat_gate_per_sample(hooks_data)
+    if G is None:
+        return m
+
+    flat = G.reshape(-1)
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        return m
+
+    m["gate_mean"] = float(np.nanmean(finite))
+    m["gate_std"]  = float(np.nanstd(finite))
+    m["gate_entropy"] = _safe_entropy(finite)
+    m["gate_kurtosis"] = _safe_kurtosis(finite)
+    m["gate_sparsity"] = _hoyer_sparsity(finite)
+
+    qs = [0.05,0.10,0.25,0.50,0.75,0.90,0.95]
+    try:
+        qv = np.quantile(finite, qs).tolist()
+        for k, v in zip(q_keys, qv):
+            m[k] = float(v)
+    except Exception:
+        pass
+    return m
+
+# ---------- 쌍 비교(perturbed vs baseline) ----------
+def compute_w3_pair_metrics(
+    base_direct: Optional[Dict],
+    pert_direct: Optional[Dict],
+    base_hooks: Optional[Dict] = None,
+    pert_hooks: Optional[Dict] = None,
+    tod_vec: Optional[np.ndarray] = None
+) -> Dict[str, float]:
+    """
+    baseline ↔ perturbed 쌍에서 Δ지표를 계산.
+    필수: mse_real / rmse / mae (둘 중 하나 있으면 나머지는 보강 계산)
+    선택: TOD 정렬(거리상관), direct_evidence의 gc_*(TOD dcor) 컬럼들
+    """
+    def _get_err(d: Optional[Dict]) -> Tuple[float,float]:
+        if not isinstance(d, dict):
+            return (float("nan"), float("nan"))
+        rmse = d.get("rmse", None)
+        mse_real = d.get("mse_real", None)
+        if rmse is None and mse_real is not None:
+            rmse = float(np.sqrt(float(mse_real)))
+        mae = d.get("mae", d.get("mae_real", float("nan")))
+        try:
+            return (float(rmse), float(mae))
+        except Exception:
+            return (float("nan"), float("nan"))
+
+    base_rmse, base_mae = _get_err(base_direct)
+    pert_rmse, pert_mae = _get_err(pert_direct)
+
+    out = {
+        "w3_delta_rmse": float("nan"),
+        "w3_delta_rmse_pct": float("nan"),
+        "w3_delta_mae": float("nan"),
+        "w3_delta_tod_align": float("nan"),
+        "w3_delta_gc_kernel_tod_dcor": float("nan"),
+        "w3_delta_gc_feat_tod_dcor": float("nan"),
+        "w3_delta_gc_feat_tod_r2": float("nan"),
+    }
+
+    if np.isfinite(base_rmse) and np.isfinite(pert_rmse):
+        out["w3_delta_rmse"] = float(pert_rmse - base_rmse)
+        if base_rmse > 0:
+            out["w3_delta_rmse_pct"] = float((out["w3_delta_rmse"] / base_rmse) * 100.0)
+        out["w3_delta_mae"] = float(pert_mae - base_mae) if np.isfinite(base_mae) and np.isfinite(pert_mae) else float("nan")
+
+    # TOD 정렬(거리상관)의 Δ (가능할 때만)
+    base_F = _concat_gate_per_sample(base_hooks)
+    pert_F = _concat_gate_per_sample(pert_hooks)
+    if (base_F is not None) and (pert_F is not None) and (tod_vec is not None) and (_dcor_u is not None):
+        a0 = _tod_align_strength(base_F, tod_vec)
+        a1 = _tod_align_strength(pert_F, tod_vec)
+        if np.isfinite(a0) and np.isfinite(a1):
+            out["w3_delta_tod_align"] = float(a1 - a0)
+
+    # direct_evidence 내 TOD 관련 지표(있으면 Δ 기록)
+    def _grab(d, k):
+        if isinstance(d, dict) and k in d:
+            try: return float(d[k])
+            except Exception: return float("nan")
+        return float("nan")
+
+    for k in ("gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2"):
+        b = _grab(base_direct, k)
+        p = _grab(pert_direct, k)
+        if np.isfinite(b) and np.isfinite(p):
+            out["w3_delta_"+k] = float(p - b)
+
     return out
