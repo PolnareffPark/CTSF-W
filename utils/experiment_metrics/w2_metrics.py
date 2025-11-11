@@ -8,6 +8,29 @@ import numpy as np
 from scipy import stats
 from utils.metrics import _dcor_u
 
+def _pearson_r2_safe(x, y, eps: float = 1e-12) -> float:
+    """
+    피어슨 상관의 제곱(r^2)을 안전하게 계산.
+    - 유한값만 사용
+    - 길이 < 3 이면 NaN
+    - 표준편차(분산) == 0 이면 0.0 (정렬 없음으로 간주)
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    L = min(x.size, y.size)
+    if L < 3:
+        return float("nan")
+    x = x[:L] - np.nanmean(x[:L])
+    y = y[:L] - np.nanmean(y[:L])
+    sx = np.nanstd(x, ddof=0); sy = np.nanstd(y, ddof=0)
+    if sx <= eps or sy <= eps:
+        return 0.0
+    r = float(np.dot(x, y) / (L * sx * sy))
+    r = float(np.clip(r, -1.0, 1.0))
+    return r * r
+
 def _as_np(a):
     try:
         if hasattr(a, "detach"):
@@ -85,10 +108,12 @@ def compute_w2_metrics(
     **kwargs
 ) -> Dict:
     """
-    W2 특화 지표(동적/정적). 동적이면 실측 gate_outputs, 정적이면 stage별/alpha 기반.
-    반환: w2_gate_variability_time, w2_gate_variability_sample, w2_gate_entropy,
-         w2_gate_tod_alignment, w2_gate_gru_state_alignment,
-         w2_event_conditional_response, w2_channel_selectivity_kurtosis, w2_channel_selectivity_sparsity
+    W2 특화 지표(동적/정적). 동적이면 실측 gate_outputs, 정적이면 파라미터 폴백.
+    반환:
+      - w2_gate_variability_time / w2_gate_variability_sample / w2_gate_entropy
+      - w2_gate_tod_alignment (dCor), w2_gate_gru_state_alignment (r^2 안전계산)
+      - w2_event_conditional_response (= var_time * cg_event_gain; 동적일 때만)
+      - w2_channel_selectivity_kurtosis / w2_channel_selectivity_sparsity (채널 선택도)
     """
     m: Dict[str, float] = {
         "w2_gate_variability_time": float("nan"),
@@ -102,56 +127,61 @@ def compute_w2_metrics(
     }
 
     # -----------------------
-    # 1) 게이트 텐서 수집
+    # 1) 게이트 / GRU 수집
     # -----------------------
-    gates_NLG = None          # (N,L,G)
-    gate_channel_vector = None  # (G,)
+    gates_NLG = None                 # (N,L,G)
+    gate_channel_vector = None       # (G,)
     gru_list = []
 
     if isinstance(hooks_data, dict):
-        # a) 동적 게이트: gate_outputs(list) 우선
-        if "gate_outputs" in hooks_data and hooks_data["gate_outputs"]:
-            gates_NLG = _concat_gate_outputs(hooks_data["gate_outputs"])
-        # b) stage dict 허용
-        if gates_NLG is None:
+        # (a) 동적 게이트: gate_outputs 우선
+        go = hooks_data.get("gate_outputs", None)
+        if go:
+            gates_NLG = _concat_gate_outputs(go)  # 각 원소를 (N,L,G)로 표준화 후 concat
+
+        # (b) stage dict에서 채널 벡터 폴백 구성
+        if gate_channel_vector is None:
             for k in ("gates_by_stage", "gate_by_stage", "gate_logs_by_stage"):
                 d = hooks_data.get(k)
                 if isinstance(d, dict) and d:
                     stage_vecs = []
-                    for s in ("S", "M", "D", "s", "m", "d"):
+                    for s in ("S","M","D","s","m","d"):
                         if s in d and d[s] is not None:
                             a = _as_np(d[s])
-                            if a is None:
+                            if a is None: 
                                 continue
                             a = np.asarray(a, float)
-                            # 마지막 축이 게이트 차원이라고 가정하고 나머지 평균
+                            # 마지막 축을 게이트 채널로 가정하고 나머지 평균 → (G,)
                             if a.ndim == 1:
-                                stage_vecs.append(a.reshape(1, -1))
+                                v = a
                             else:
                                 gdim = -1
                                 axes = tuple(i for i in range(a.ndim) if i != gdim)
-                                stage_vecs.append(np.nanmean(a, axis=axes, keepdims=True))
+                                v = np.nanmean(a, axis=axes)
+                            if v is not None and v.size >= 1:
+                                stage_vecs.append(v.reshape(-1))
                     if stage_vecs:
-                        gate_channel_vector = np.nanmean(np.concatenate(stage_vecs, axis=0), axis=0).reshape(-1)
+                        gate_channel_vector = np.nanmean(np.stack(stage_vecs, axis=0), axis=0).reshape(-1)
                     break
-        # GRU 상태(가능하면)
-        for k in ("gru_states", "gru_hidden", "gru_h_list", "h_list", "hidden_states"):
+
+        # (c) GRU 상태 수집
+        for k in ("gru_states","gru_hidden","gru_h_list","h_list","hidden_states"):
             if k in hooks_data and hooks_data[k] is not None:
                 gru_list = hooks_data[k] if isinstance(hooks_data[k], list) else [hooks_data[k]]
                 break
 
-    # c) 완전 폴백(정적 모델 파라미터)
+    # (d) 완전 폴백: 모델 파라미터에서 채널 벡터 구성(정적에도 값이 나오도록)
     if gates_NLG is None and gate_channel_vector is None and hasattr(model, "xhconv_blks"):
         chans = []
         for blk in getattr(model, "xhconv_blks", []):
-            for name in ("alpha", "cross_gate", "gate", "w", "g"):
+            for name in ("alpha","cross_gate","gate","w","g"):
                 if hasattr(blk, name):
                     v = _as_np(getattr(blk, name))
                     if v is None:
                         continue
                     v = np.asarray(v, float)
-                    if v.ndim == 2:  # (2,2) 등
-                        chans.append(v.reshape(-1))
+                    if v.ndim >= 2:
+                        chans.append(v.reshape(-1))  # (2,2) 등은 4채널로 간주
                         break
                     if v.ndim == 1:
                         chans.append(v)
@@ -165,18 +195,30 @@ def compute_w2_metrics(
     is_dynamic = isinstance(gates_NLG, np.ndarray)
 
     if is_dynamic:
-        # (N,L,G)
+        # (N,L,G) 보장
+        if gates_NLG.ndim != 3:
+            # 중간축을 L로 펴서 3차원으로 표준화
+            gates_NLG = _to_NLG(gates_NLG)
         N, L, G = gates_NLG.shape
+
         # 시간/샘플 변동성
-        m["w2_gate_variability_time"]   = float(np.nanmean(np.nanstd(gates_NLG.reshape(N, -1), axis=1)))
-        m["w2_gate_variability_sample"] = float(np.nanmean(np.nanstd(gates_NLG, axis=0)))  # (L,G) std의 평균
-        # 엔트로피
+        #  - 시간 변동성: L축 표준편차의 평균
+        #  - 샘플 변동성: N축 표준편차의 평균
+        try:
+            m["w2_gate_variability_time"]   = float(np.nanmean(np.nanstd(gates_NLG, axis=1)))  # (N,G) -> mean
+        except Exception:
+            # 보수적 폴백(샘플별 flatten 표준편차 평균)
+            m["w2_gate_variability_time"] = float(np.nanmean(np.nanstd(gates_NLG.reshape(N, -1), axis=1)))
+        m["w2_gate_variability_sample"] = float(np.nanmean(np.nanstd(gates_NLG, axis=0)))      # (L,G) -> mean
+
+        # 엔트로피(양수영역 정규화)
         flat = gates_NLG.reshape(-1)
-        pos = flat[np.isfinite(flat) & (flat > 1e-8)]
+        pos  = flat[np.isfinite(flat) & (flat > 1e-8)]
         if pos.size > 0:
             p = pos / (pos.sum() + 1e-12)
             m["w2_gate_entropy"] = float(-np.sum(p * np.log(p + 1e-12)))
-        # TOD 정렬
+
+        # TOD 정렬 (거리상관)
         if isinstance(tod_vec, np.ndarray) and tod_vec.ndim == 2 and tod_vec.shape[0] > 2:
             g_strength = np.nanmean(gates_NLG, axis=(1, 2))  # (N,)
             gx, ty = _align_len(g_strength.reshape(-1), tod_vec.reshape(len(tod_vec), -1))
@@ -185,37 +227,46 @@ def compute_w2_metrics(
                     m["w2_gate_tod_alignment"] = float(_dcor_u(gx.reshape(-1,1), ty))
                 except Exception:
                     m["w2_gate_tod_alignment"] = float("nan")
-        # GRU 정렬
+
+        # GRU 정렬 (안전한 r^2)
         if gru_list:
             try:
                 gru = np.concatenate([_as_np(a) for a in gru_list if _as_np(a) is not None], axis=0)
-                if gru.ndim >= 2:
-                    g_strength = np.nanmean(gates_NLG, axis=(1, 2))
-                    gn = np.linalg.norm(gru, axis=1)
-                    gx, hy = _align_len(g_strength.reshape(-1), gn.reshape(-1))
-                    if gx.size >= 3:
-                        r = np.corrcoef(gx, hy)[0, 1]
-                        m["w2_gate_gru_state_alignment"] = float(r * r) if np.isfinite(r) else float("nan")
+                if gru.ndim == 1:
+                    gn = np.abs(gru).reshape(-1)
+                else:
+                    # (N, d) 또는 (N,*,d) → (N,-1)로 평탄화 후 L2 norm
+                    if gru.ndim > 2:
+                        gru = gru.reshape(gru.shape[0], -1)
+                    gn = np.linalg.norm(gru, axis=1)  # (N,)
+                g_strength = np.nanmean(gates_NLG, axis=(1, 2))  # (N,)
+                gx, hy = _align_len(g_strength.reshape(-1), gn.reshape(-1))
+                m["w2_gate_gru_state_alignment"] = _pearson_r2_safe(gx, hy)
             except Exception:
+                # 훅이 없거나 길이 불일치 등 → NaN 유지
                 pass
-        # 채널 선택도(동적): (G,)
+
+        # 채널 선택도(동적): (G,) = mean(N,L)
         gate_channel_vector = np.nanmean(gates_NLG, axis=(0, 1))  # (G,)
+
     else:
-        # static: TOD/GRU 정렬은 정의상 0.0
+        # 정적: TOD/GRU 정렬은 정의상 0(시간/샘플 변화가 없으므로)
         m["w2_gate_tod_alignment"] = 0.0
         m["w2_gate_gru_state_alignment"] = 0.0
+        # 변동성 지표는 패키징 루트(분포 요약)에서 병합되므로 여기서는 건드리지 않음
 
-    # 채널 선택도(첨도/희소성): 동적이면 위에서 설정, 아니면 폴백 벡터 사용
+    # 채널 선택도(첨도/희소성): 동적 또는 폴백 벡터가 있으면 항상 채움
     if gate_channel_vector is not None and gate_channel_vector.size >= 2:
         m["w2_channel_selectivity_kurtosis"] = _safe_kurtosis(gate_channel_vector)
         m["w2_channel_selectivity_sparsity"] = _hoyer_sparsity(gate_channel_vector)
 
-    # 이벤트 조건 반응(있는 경우만)
+    # 이벤트 조건 반응(동적일 때만 의미)
     cg_event_gain = None
     if isinstance(direct_evidence, dict):
         cg_event_gain = direct_evidence.get("cg_event_gain", None)
-    if (cg_event_gain is not None and isinstance(cg_event_gain, (int,float)) 
-        and np.isfinite(cg_event_gain) and np.isfinite(m.get("w2_gate_variability_time", np.nan))):
-        m["w2_event_conditional_response"] = float(m["w2_gate_variability_time"] * cg_event_gain)
+    if is_dynamic and isinstance(cg_event_gain, (int, float)) and np.isfinite(cg_event_gain):
+        gv = m.get("w2_gate_variability_time", np.nan)
+        if np.isfinite(gv):
+            m["w2_event_conditional_response"] = float(gv * float(cg_event_gain))
 
     return m

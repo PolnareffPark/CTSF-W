@@ -199,34 +199,45 @@ class W2Experiment(BaseExperiment):
         compute_all_experiment_metrics(...)로 direct_evidence를 보강한 뒤,
         self._last_hooks_data / self._last_direct에 저장합니다.
         """
+        # 1) TOD 벡터 구성
         tod_vec = build_test_tod_vector(self.cfg)
 
-        # 1) direct evidence 실행: 게이트 + (가능하면) GRU 상태까지 후킹
+        # 2) 직접증거 평가 호출: 게이트/GRU 상태 모두 수집
         try:
             direct = evaluate_with_direct_evidence(
-                self.model, self.test_loader, self.mu, self.std,
-                tod_vec=tod_vec, device=self.device,
+                self.model,
+                self.test_loader,
+                self.mu,
+                self.std,
+                tod_vec=tod_vec,
+                device=self.device,
                 collect_gate_outputs=True,
-                collect_gru_states=True,   # ★ GRU 상태 후킹
+                collect_gru_states=True,   # ★ 핵심: GRU 상태 후킹 보장
             )
         except TypeError:
+            # 구버전 시그니처 호환
             direct = evaluate_with_direct_evidence(
-                self.model, self.test_loader, self.mu, self.std,
-                tod_vec=tod_vec, device=self.device,
+                self.model,
+                self.test_loader,
+                self.mu,
+                self.std,
+                tod_vec=tod_vec,
+                device=self.device,
                 collect_gate_outputs=True,
             )
 
-        # 2) hooks_data 구성
+        # 3) hooks_data 구성
         hooks_data: Dict[str, Any] = {}
         w2_hooks = direct.pop("hooks_data", None)
         if isinstance(w2_hooks, dict) and len(w2_hooks) > 0:
             hooks_data.update(w2_hooks)
 
-        for k in ("gate_outputs","gru_states","gates_by_stage","gate_by_stage"):
+        # 루트에 있을 수도 있는 후킹 산출물을 안전하게 병합
+        for k in ("gate_outputs", "gru_states", "gates_by_stage", "gate_by_stage"):
             if k in direct and k not in hooks_data:
                 hooks_data[k] = direct[k]
 
-        # 3) 실험 공통 지표 병합(있으면)
+        # 4) 실험 공통 지표 계산(있으면 direct에 병합)
         try:
             exp_specific = compute_all_experiment_metrics(
                 experiment_type=self.experiment_type,
@@ -238,11 +249,12 @@ class W2Experiment(BaseExperiment):
                 active_layers=[],
             )
             if isinstance(exp_specific, dict):
-                direct.update(exp_specific)
+                for k, v in exp_specific.items():
+                    direct[k] = v
         except ImportError:
             pass
 
-        # 4) 캐싱
+        # 5) 최종 캐싱
         self._plotting_payload = {}
         self._last_hooks_data = copy.deepcopy(hooks_data)
         self._last_direct = copy.deepcopy(direct)
