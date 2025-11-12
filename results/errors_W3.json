@@ -1,0 +1,32 @@
+[
+  {
+    "timestamp": "2025-11-12T09:01:12.051773",
+    "experiment_type": "W3",
+    "dataset": "ETTh1",
+    "horizon": 96,
+    "seed": 42,
+    "mode": "none",
+    "error_message": "",
+    "error_traceback": "Traceback (most recent call last):\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/run_suite.py\", line 208, in run_experiment_suite\n    exp = W3Experiment(cfg)\n          ^^^^^^^^^^^^^^^^^\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/w3_experiment.py\", line 81, in __init__\n    super().__init__(cfg_local)\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/base_experiment.py\", line 41, in __init__\n    self.model = self._create_model()\n                 ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/base_experiment.py\", line 74, in _create_model\n    raise NotImplementedError\nNotImplementedError\n"
+  },
+  {
+    "timestamp": "2025-11-12T09:01:12.096667",
+    "experiment_type": "W3",
+    "dataset": "ETTh1",
+    "horizon": 96,
+    "seed": 42,
+    "mode": "tod_shift",
+    "error_message": "",
+    "error_traceback": "Traceback (most recent call last):\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/run_suite.py\", line 208, in run_experiment_suite\n    exp = W3Experiment(cfg)\n          ^^^^^^^^^^^^^^^^^\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/w3_experiment.py\", line 81, in __init__\n    super().__init__(cfg_local)\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/base_experiment.py\", line 41, in __init__\n    self.model = self._create_model()\n                 ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/base_experiment.py\", line 74, in _create_model\n    raise NotImplementedError\nNotImplementedError\n"
+  },
+  {
+    "timestamp": "2025-11-12T09:01:12.154647",
+    "experiment_type": "W3",
+    "dataset": "ETTh1",
+    "horizon": 96,
+    "seed": 42,
+    "mode": "smooth",
+    "error_message": "",
+    "error_traceback": "Traceback (most recent call last):\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/run_suite.py\", line 208, in run_experiment_suite\n    exp = W3Experiment(cfg)\n          ^^^^^^^^^^^^^^^^^\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/w3_experiment.py\", line 81, in __init__\n    super().__init__(cfg_local)\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/base_experiment.py\", line 41, in __init__\n    self.model = self._create_model()\n                 ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/base_experiment.py\", line 74, in _create_model\n    raise NotImplementedError\nNotImplementedError\n"
+  }
+]

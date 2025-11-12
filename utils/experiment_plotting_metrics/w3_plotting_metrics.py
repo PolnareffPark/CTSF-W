@@ -1,20 +1,20 @@
-# ============================================================
 # utils/experiment_plotting_metrics/w3_plotting_metrics.py
-#   - W3 전용: Forest Plot(Δ집계) + Perturbation ΔBar 저장
-#   - summary + detail (append + dedupe + atomic write)
-#   - pandas futurewarning 회피: include_groups=False 지원 시 사용
+# ============================================================
+# 저장 규칙: summary / detail 분리, append+dedupe, 원자 저장
+# 키 규칙: W1/W2와 동일 + perturbation
 # ============================================================
 
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
-import math
 import numpy as np
 import pandas as pd
+import math
+import time
 
 _W3_KEYS = [
-    "experiment_type","dataset","plot_type","horizon","seed","mode",
-    "model_tag","run_tag","perturb_type","condition"  # baseline / perturbed
+    "experiment_type","dataset","plot_type","horizon","seed",
+    "perturbation","model_tag","run_tag"
 ]
 
 def _ensure_dir(p: str | Path) -> Path:
@@ -22,7 +22,7 @@ def _ensure_dir(p: str | Path) -> Path:
 
 def _atomic_write_csv(df: pd.DataFrame, path: str | Path) -> None:
     path = _ensure_dir(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".tmp{int(time.time()*1000)}")
     df.to_csv(tmp, index=False)
     tmp.replace(path)
 
@@ -36,11 +36,14 @@ def _append_or_update_row(csv_path: str | Path, row: Dict[str,Any], subset_keys:
             if c not in old.columns: old[c] = np.nan
         for c in old.columns:
             if c not in new.columns: new[c] = np.nan
-        df = pd.concat([old, new], ignore_index=True)
-        df.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
-        _atomic_write_csv(df, path)
+        # 중복 덮어쓰기
+        mask = np.ones(len(old), dtype=bool)
+        for k in subset_keys:
+            if k in old.columns:
+                mask &= (old[k] == row.get(k))
+        out = pd.concat([old[~mask], new], ignore_index=True)
+        _atomic_write_csv(out, path)
     else:
-        new.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
         _atomic_write_csv(new, path)
 
 def _append_or_update_rows(csv_path: str | Path, rows: List[Dict[str,Any]], subset_keys: List[str]) -> None:
@@ -60,141 +63,159 @@ def _append_or_update_rows(csv_path: str | Path, rows: List[Dict[str,Any]], subs
         new.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
         _atomic_write_csv(new, path)
 
-def _to_f32(v: Any, ndigits: int = 6) -> float:
+def _f32(x, ndigits=6):
     try:
-        f = float(v); 
-        if not np.isfinite(f): return np.nan
-        return float(np.round(np.float32(f), ndigits))
+        v = float(x)
+        if not np.isfinite(v): return np.nan
+        return float(np.round(np.float32(v), ndigits))
     except Exception:
         return np.nan
 
-def _zscore(series: pd.Series) -> pd.Series:
-    s = series.astype(float)
-    m = s.mean(); sd = s.std(ddof=0)
-    if not np.isfinite(sd) or sd == 0: 
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - m) / sd
-
-# =============== 1) Forest raw(detail) ===============
-def save_w3_forest_detail_row(
-    ctx: Dict[str,Any],             # plot_type='forest_plot'
+# ------------------------------------------------------------
+# 1) 실행 raw 저장 (baseline/perturb 공통)
+# ------------------------------------------------------------
+def save_w3_run_detail_row(
+    ctx: Dict[str,Any],   # plot_type='w3_run'
     rmse_real: float,
     mae_real: float,
+    other_cols: Optional[Dict[str,Any]],
     detail_csv: str | Path
 ) -> None:
     """
-    baseline/perturbed 각 1행씩 저장(조건은 ctx['condition']).
+    results_W3.csv와 동일 맥락의 실행 단위 raw를 detail로도 남겨둠(재현/검증용).
     """
-    assert ctx.get("plot_type") == "forest_plot"
     row = {
         **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-        "rmse_real": _to_f32(rmse_real),
-        "mae_real":  _to_f32(mae_real),
+        "rmse_real": _f32(rmse_real),
+        "mae_real":  _f32(mae_real),
     }
+    if other_cols:
+        for k, v in other_cols.items():
+            # 숫자 위주만 저장; 문자열은 필요 최소
+            if isinstance(v, (int, float, np.floating)):
+                row[k] = _f32(v)
     _append_or_update_row(detail_csv, row, subset_keys=_W3_KEYS)
 
-# =============== 2) Forest summary(Δ/CI/Top-pick) ===============
-def rebuild_w3_forest_summary(
-    detail_csv: str | Path,          # 입력 raw(detail)
-    summary_csv: str | Path,         # 출력 summary
-    per_cond: str = "perturbed",
-    last_cond: str = "baseline",
-    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon","perturb_type")
-) -> pd.DataFrame:
-    """
-    baseline↔perturbed 매칭하여 Δ지표 집계.
-    Δ 정의: ΔRMSE = rmse_pert - rmse_base (양수=성능저하), ΔMAE 유사, ΔRMSE% = ΔRMSE / rmse_base * 100
-    groupby.apply의 FutureWarning 회피: include_groups=False 사용(미지원 시 안전 폴백).
-    """
-    detail_csv = Path(detail_csv)
-    if not detail_csv.exists():
-        out = pd.DataFrame(columns=list(group_keys)+[
-            "n_pairs","delta_rmse_mean","delta_rmse_pct_mean","delta_mae_mean","top_pick_score_w3_mean"
-        ])
-        _atomic_write_csv(out, summary_csv); return out
-
-    df = pd.read_csv(detail_csv)
-    need = set(group_keys) | {"seed","mode","condition","rmse_real","mae_real"}
-    miss = [c for c in need if c not in df.columns]
-    if miss:
-        raise ValueError(f"Missing columns in forest detail csv: {miss}")
-
-    per = df[df["condition"]==per_cond].copy()
-    lst = df[df["condition"]==last_cond].copy()
-    on = list(group_keys) + ["seed","mode"]
-    base = per.merge(lst, on=on, suffixes=("_per","_base"))
-    if len(base)==0:
-        out = pd.DataFrame(columns=list(group_keys)+[
-            "n_pairs","delta_rmse_mean","delta_rmse_pct_mean","delta_mae_mean","top_pick_score_w3_mean"
-        ])
-        _atomic_write_csv(out, summary_csv); return out
-
-    base["delta_rmse"] = (base["rmse_real_per"] - base["rmse_real_base"]).astype(np.float32)
-    base["delta_rmse_pct"] = (base["delta_rmse"] / base["rmse_real_base"]).astype(np.float32) * 100.0
-    base["delta_mae"]  = (base["mae_real_per"]  - base["mae_real_base"]).astype(np.float32)
-
-    # 그룹별 top-pick 점수(z‑sum). FutureWarning 방지 처리 포함.
-    def _top_score(gr: pd.DataFrame) -> pd.DataFrame:
-        z_rmsp = _zscore(gr["delta_rmse_pct"].fillna(0.0))
-        gr["top_pick_score_w3"] = z_rmsp  # W3 기본은 ΔRMSE% 중심(필요 시 다른 Δ 추가 가능)
-        return gr
-
-    try:
-        base = base.groupby(list(group_keys), group_keys=False).apply(_top_score, include_groups=False)
-    except TypeError:
-        base = base.groupby(list(group_keys), group_keys=False).apply(_top_score)
-
-    def _ci_mean(a: np.ndarray) -> float:
-        a = a[np.isfinite(a)]
-        if a.size == 0: return np.nan
-        return _to_f32(float(np.mean(a)))
-
-    rows: List[Dict[str,Any]] = []
-    for gvals, gdf in base.groupby(list(group_keys)):
-        row = {
-            **{k:v for k,v in zip(group_keys,gvals)},
-            "n_pairs": int(len(gdf)),
-            "delta_rmse_mean":      _ci_mean(gdf["delta_rmse"].values.astype(np.float64)),
-            "delta_rmse_pct_mean":  _ci_mean(gdf["delta_rmse_pct"].values.astype(np.float64)),
-            "delta_mae_mean":       _ci_mean(gdf["delta_mae"].values.astype(np.float64)),
-            "top_pick_score_w3_mean": _ci_mean(gdf["top_pick_score_w3"].values.astype(np.float64)),
-        }
-        rows.append(row)
-
-    out = pd.DataFrame(rows)
-    _atomic_write_csv(out, summary_csv)
-    return out
-
-# =============== 3) Perturbation ΔBar (요약/상세) ===============
+# ------------------------------------------------------------
+# 2) 개입 효과(Δ) 바 플롯 데이터: summary + detail
+#    - ΔRMSE%, ΔTOD/ΔPEAK 핵심 지표, d, d_z
+# ------------------------------------------------------------
 def save_w3_perturb_delta_bar(
     ctx: Dict[str,Any],               # plot_type='perturb_delta_bar'
-    metrics: Dict[str,Any],           # 기대: w3_delta_rmse_pct (필수), 선택: 기타 Δ*
+    effect: Dict[str,Any],            # compute_w3_metrics 결과
     out_dir: str | Path
 ) -> None:
-    """
-    바 플롯용 요약/상세 데이터 저장. (세부 플로팅은 노트북/스크립트에서 재현)
-    summary: delta_rmse_pct / delta_rmse / delta_mae / top_pick 점수(있으면)
-    detail: (metric, value) long form
-    """
-    assert ctx.get("plot_type") == "perturb_delta_bar"
-    summary_csv = Path(out_dir) / "perturb_delta_bar_summary.csv"
-    detail_csv  = Path(out_dir) / "perturb_delta_bar_detail.csv"
-
-    row = {
+    out_dir = Path(out_dir)
+    # summary(1행)
+    summary_row = {
         **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-        "delta_rmse_pct": _to_f32(metrics.get("w3_delta_rmse_pct")),
-        "delta_rmse":     _to_f32(metrics.get("w3_delta_rmse")),
-        "delta_mae":      _to_f32(metrics.get("w3_delta_mae")),
-        "delta_tod_align":_to_f32(metrics.get("w3_delta_tod_align")),
+        "delta_rmse":       _f32(effect.get("w3_delta_rmse")),
+        "delta_rmse_pct":   _f32(effect.get("w3_delta_rmse_pct")),
+        "delta_mae":        _f32(effect.get("w3_delta_mae")),
+        # TOD
+        "delta_gc_kernel_tod_dcor": _f32(effect.get("w3_delta_gc_kernel_tod_dcor")),
+        "delta_gc_feat_tod_dcor":   _f32(effect.get("w3_delta_gc_feat_tod_dcor")),
+        "delta_gc_feat_tod_r2":     _f32(effect.get("w3_delta_gc_feat_tod_r2")),
+        # PEAK
+        "delta_cg_event_gain":      _f32(effect.get("w3_delta_cg_event_gain")),
+        "delta_cg_bestlag_abs":     _f32(effect.get("w3_delta_cg_bestlag_abs")),
+        "delta_cg_spearman_mean":   _f32(effect.get("w3_delta_cg_spearman_mean")),
+        # Effect size
+        "effect_d":  _f32(effect.get("w3_effect_d")),
+        "effect_dz": _f32(effect.get("w3_effect_dz")),
+        "dz_lo":     _f32(effect.get("w3_dz_lo")),
+        "dz_hi":     _f32(effect.get("w3_dz_hi")),
+        # Hypothesis flags
+        "tod_support":   _f32(effect.get("w3_hypothesis_tod_support")),
+        "peak_support":  _f32(effect.get("w3_hypothesis_peak_support")),
     }
-    _append_or_update_row(summary_csv, row, subset_keys=_W3_KEYS)
+    summary_csv = out_dir / "perturb_delta_bar_summary.csv"
+    _append_or_update_row(summary_csv, summary_row, subset_keys=_W3_KEYS)
 
-    det_rows = []
-    for k in ("w3_delta_rmse_pct","w3_delta_rmse","w3_delta_mae","w3_delta_tod_align",
-              "w3_delta_gc_kernel_tod_dcor","w3_delta_gc_feat_tod_dcor","w3_delta_gc_feat_tod_r2"):
-        if k in metrics and metrics[k] is not None:
-            v = _to_f32(metrics.get(k))
-            if np.isfinite(v):
-                det_rows.append({**{kk: ctx[kk] for kk in _W3_KEYS if kk in ctx}, "metric": k, "value": v})
-    if det_rows:
-        _append_or_update_rows(detail_csv, det_rows, subset_keys=_W3_KEYS + ["metric"])
+    # detail(long): metric, value
+    detail_rows: List[Dict[str,Any]] = []
+    for mk, col in [
+        ("delta_rmse_pct", "delta_rmse_pct"),
+        ("delta_rmse",     "delta_rmse"),
+        ("delta_mae",      "delta_mae"),
+        ("delta_gc_kernel_tod_dcor","delta_gc_kernel_tod_dcor"),
+        ("delta_gc_feat_tod_dcor","delta_gc_feat_tod_dcor"),
+        ("delta_gc_feat_tod_r2","delta_gc_feat_tod_r2"),
+        ("delta_cg_event_gain","delta_cg_event_gain"),
+        ("delta_cg_bestlag_abs","delta_cg_bestlag_abs"),
+        ("delta_cg_spearman_mean","delta_cg_spearman_mean"),
+        ("effect_d","effect_d"),("effect_dz","effect_dz")
+    ]:
+        v = summary_row.get(col, np.nan)
+        if np.isfinite(v):
+            detail_rows.append({
+                **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+                "metric": mk, "value": _f32(v)
+            })
+    if detail_rows:
+        detail_csv = out_dir / "perturb_delta_bar_detail.csv"
+        _append_or_update_rows(detail_csv, detail_rows, subset_keys=_W3_KEYS + ["metric"])
+
+# ------------------------------------------------------------
+# 3) 순위 보존(rank) 저장: summary + detail
+# ------------------------------------------------------------
+def save_w3_rank_preservation(
+    ctx: Dict[str,Any],               # plot_type='rank_preservation'
+    effect: Dict[str,Any],            # compute_w3_metrics 결과
+    out_dir: str | Path
+) -> None:
+    summary_row = {
+        **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+        "spearman_rho":  _f32(effect.get("w3_rank_spearman")),
+        "topk_preserve": _f32(effect.get("w3_rank_topk_preserve")),
+    }
+    summary_csv = Path(out_dir) / "rank_preservation_summary.csv"
+    _append_or_update_row(summary_csv, summary_row, subset_keys=_W3_KEYS)
+
+# ------------------------------------------------------------
+# 4) 라그 변화(PEAK 관련): summary + detail
+# ------------------------------------------------------------
+def save_w3_lag_shift(
+    ctx: Dict[str,Any],               # plot_type='lag_shift'
+    base_bestlag: float,
+    pert_bestlag: float,
+    out_dir: str | Path
+) -> None:
+    delta_abs = np.nan
+    if np.isfinite(base_bestlag) and np.isfinite(pert_bestlag):
+        delta_abs = abs(float(pert_bestlag)) - abs(float(base_bestlag))
+    summary_row = {
+        **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+        "base_bestlag": _f32(base_bestlag),
+        "pert_bestlag": _f32(pert_bestlag),
+        "delta_abs":    _f32(delta_abs),
+    }
+    summary_csv = Path(out_dir) / "lag_shift_summary.csv"
+    _append_or_update_row(summary_csv, summary_row, subset_keys=_W3_KEYS)
+
+# ------------------------------------------------------------
+# 5) 그룹 집계(시드 평균) - Δ 막대 요약 재작성
+# ------------------------------------------------------------
+def rebuild_w3_perturb_summary(
+    delta_detail_csv: str | Path,     # perturb_delta_bar_detail.csv
+    delta_summary_csv: str | Path,    # perturb_delta_bar_summary.csv (출력 재작성)
+    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon","perturbation"),
+) -> pd.DataFrame:
+    dpath = Path(delta_detail_csv)
+    if not dpath.exists():
+        out = pd.DataFrame(columns=list(group_keys)+["metric","value_mean"])
+        _atomic_write_csv(out, delta_summary_csv)
+        return out
+    df = pd.read_csv(dpath)
+    need = set(group_keys) | {"metric","value"}
+    if not need.issubset(df.columns):
+        _atomic_write_csv(pd.DataFrame(columns=list(need)), delta_summary_csv)
+        return pd.DataFrame(columns=list(need))
+    rows: List[Dict[str,Any]] = []
+    for keys, g in df.groupby(list(group_keys), group_keys=False):
+        g2 = g.copy()
+        for mk, s in g2.groupby("metric", group_keys=False):
+            rows.append({**{k:v for k,v in zip(group_keys, keys)}, "metric": mk, "value_mean": float(np.nanmean(s["value"]))})
+    out = pd.DataFrame(rows)
+    _atomic_write_csv(out, delta_summary_csv)
+    return out
