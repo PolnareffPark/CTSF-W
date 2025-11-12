@@ -1,0 +1,4 @@
+experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag,tod_bins,tod_amp_s,tod_amp_m,tod_amp_d,tod_amp_mean,valid_ratio,nan_count,amp_method
+W3,ETTm2,gate_tod_heatmap,96,42,none,HyperConv,W3_ETTm2_96_42_none,4,,0.888418972492218,,0.888418972492218,1.0,0,range
+W3,ETTm2,gate_tod_heatmap,96,42,tod_shift,HyperConv,W3_ETTm2_96_42_tod_shift,4,,0.888418972492218,,0.888418972492218,1.0,0,range
+W3,ETTm2,gate_tod_heatmap,96,42,smooth,HyperConv,W3_ETTm2_96_42_smooth,4,,0.888418972492218,,0.888418972492218,1.0,0,range

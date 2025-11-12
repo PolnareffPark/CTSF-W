@@ -1,0 +1,4 @@
+experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag,gate_mean,gate_std,gate_entropy,valid_ratio,nan_count
+W3,ETTh2,gate_distribution,96,42,none,HyperConv,W3_ETTh2_96_42_none,0.4961940050125122,0.4469850063323974,10.253320693969728,1.0,0
+W3,ETTh2,gate_distribution,96,42,tod_shift,HyperConv,W3_ETTh2_96_42_tod_shift,0.4961940050125122,0.4469850063323974,10.253320693969728,1.0,0
+W3,ETTh2,gate_distribution,96,42,smooth,HyperConv,W3_ETTh2_96_42_smooth,0.4961940050125122,0.44698500633239746,10.253320693969727,1.0,0
