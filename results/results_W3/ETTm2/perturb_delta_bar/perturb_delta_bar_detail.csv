@@ -1,7 +1,13 @@
 experiment_type,dataset,horizon,seed,perturbation,metric,delta
+W3,ETTh2,96,42,tod_shift,gc_kernel_tod_dcor,0.0
+W3,ETTh2,96,42,tod_shift,gc_feat_tod_dcor,0.0
+W3,ETTh2,96,42,tod_shift,gc_feat_tod_r2,0.0
 W3,ETTm2,96,42,tod_shift,gc_kernel_tod_dcor,0.0
 W3,ETTm2,96,42,tod_shift,gc_feat_tod_dcor,0.0
 W3,ETTm2,96,42,tod_shift,gc_feat_tod_r2,0.0
+W3,ETTh2,96,42,smooth,cg_event_gain,0.0
+W3,ETTh2,96,42,smooth,cg_bestlag,0.0
+W3,ETTh2,96,42,smooth,cg_spearman_mean,0.0
 W3,ETTm2,96,42,smooth,cg_event_gain,0.0
 W3,ETTm2,96,42,smooth,cg_bestlag,0.0
 W3,ETTm2,96,42,smooth,cg_spearman_mean,0.0

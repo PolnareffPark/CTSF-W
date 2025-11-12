@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-
+import torch
 from .base_experiment import BaseExperiment
 from data.dataset import build_test_tod_vector
 from models.ctsf_model import HybridTS
@@ -71,6 +71,49 @@ def _merge_cg_gc(row: dict, de: Optional[dict]) -> dict:
                 row[k] = de[k]
     return row
 
+class _TODShiftWrapper:
+    def __init__(self, base, dataset_tag: str, max_shift: int = 8):
+        self.base = base; self.dataset_tag = (dataset_tag or "").lower(); self.max_shift = int(max_shift)
+    def __len__(self): return len(self.base)
+    def __getitem__(self, idx):
+        import numpy as np, torch
+        it = self.base[idx]
+        if not isinstance(it, (list,tuple)) or len(it)<2: return it
+        x, y = it[0], it[1]
+        arr = x.detach().cpu().numpy() if hasattr(x,"detach") else np.asarray(x)
+        # 시간축 추정
+        expected = {96} if "ettm" in self.dataset_tag else ({24} if "etth" in self.dataset_tag else {144})
+        cand = [i for i,sz in enumerate(arr.shape) if sz in expected] or [i for i,sz in enumerate(arr.shape) if sz>=12]
+        t_axis = cand[0] if cand else (arr.ndim-1)
+        shift = np.random.randint(-self.max_shift, self.max_shift+1)
+        arr = np.roll(arr, shift=shift, axis=t_axis)
+        x2 = torch.as_tensor(arr, dtype=x.dtype, device=x.device) if hasattr(x,"detach") else arr
+        return (x2, y, *it[2:])
+
+class _SmoothWrapper:
+    def __init__(self, base, dataset_tag: str, win: int = 5):
+        self.base = base; self.dataset_tag = (dataset_tag or "").lower(); self.win = int(win if win%2==1 else win+1)
+    def __len__(self): return len(self.base)
+    def __getitem__(self, idx):
+        import numpy as np, torch
+        it = self.base[idx]
+        if not isinstance(it, (list,tuple)) or len(it)<2: return it
+        x, y = it[0], it[1]
+        arr = x.detach().cpu().numpy() if hasattr(x,"detach") else np.asarray(x)
+        expected = {96} if "ettm" in self.dataset_tag else ({24} if "etth" in self.dataset_tag else {144})
+        cand = [i for i,sz in enumerate(arr.shape) if sz in expected] or [i for i,sz in enumerate(arr.shape) if sz>=12]
+        t_axis = cand[0] if cand else (arr.ndim-1)
+        # 간단 이동평균
+        k = self.win; ker = np.ones(k, dtype=float)/k; pad=k//2
+        arr_mv = np.moveaxis(arr, t_axis, -1); shp=arr_mv.shape
+        flat = arr_mv.reshape(-1, shp[-1])
+        # reflect padding
+        left  = flat[:,1:pad+1][:, ::-1]; right = flat[:,-pad-1:-1][:, ::-1]
+        paded = np.concatenate([left, flat, right], axis=1)
+        sm = np.apply_along_axis(lambda v: np.convolve(v, ker, mode="valid"), 1, paded).reshape(shp)
+        sm = np.moveaxis(sm, -1, t_axis)
+        x2 = torch.as_tensor(sm, dtype=x.dtype, device=x.device) if hasattr(x,"detach") else sm
+        return (x2, y, *it[2:])
 
 # ============================================================
 # W3 Experiment
@@ -83,13 +126,20 @@ class W3Experiment(BaseExperiment):
       - 사후: forest Δ, perturb_delta_bar Δ 집계
     """
 
-    def __init__(self, cfg: Dict[str, Any]):
-        cfg_local = copy.deepcopy(cfg or {})
-        cfg_local.setdefault("experiment_type", EXP_TAG)
-        # ★ BaseExperiment를 '상속'하여 초기화: 내부에서 BaseExperiment(...)를 별도 생성하면 안 됨
+    def __init__(self, cfg):
+        cfg_local = dict(cfg)
+        cfg_local["experiment_type"] = "W3"
         super().__init__(cfg_local)
-        self._last_hooks_data: Dict[str, Any] = {}
-        self._last_direct: Dict[str, Any] = {}
+        # --- (선택) W3 모드에 따라 학습 로더만 교란 주입 ---
+        try:
+            mode = str(self.cfg.get("mode","none")).lower()
+            dtag = str(self.dataset_tag).lower()
+            if mode == "tod_shift" and "ettm2" in dtag:
+                self.train_loader.dataset = _TODShiftWrapper(self.train_loader.dataset, dataset_tag=dtag, max_shift=8)
+            elif mode == "smooth" and "etth2" in dtag:
+                self.train_loader.dataset = _SmoothWrapper(self.train_loader.dataset, dataset_tag=dtag, win=5)
+        except Exception:
+            pass
 
     # ------------------------------
     # BaseExperiment 구현부
@@ -114,51 +164,78 @@ class W3Experiment(BaseExperiment):
 
     def evaluate_test(self):
         """
-        - 게이트/GRU 상태 후킹을 최대한 흡수(키 다양성 허용).
-        - W3는 per-run 원자료 저장이 목적이므로, 여기서는 direct_evidence를 풍부히 보강만.
+        W3는 게이트 기반 그림이 필요하므로 collect_gate_outputs=True로 direct_evidence를 수집한다.
+        또한 gate_log_s/m/d가 있으면 gates_by_stage에 흡수하여 plotting으로 넘긴다.
+        나머지는 BaseExperiment.evaluate_test 흐름을 따른다.
         """
         tod_vec = build_test_tod_vector(self.cfg)
-        try:
-            direct = evaluate_with_direct_evidence(
-                self.model, self.test_loader, self.mu, self.std,
-                tod_vec=tod_vec, device=self.device,
-                collect_gate_outputs=True,  # gate_outputs, gates_by_stage, ...
-                collect_gru_states=True,    # gru_states (가능 시)
-            )
-        except TypeError:
-            # 구버전 호환
-            direct = evaluate_with_direct_evidence(
-                self.model, self.test_loader, self.mu, self.std,
-                tod_vec=tod_vec, device=self.device,
-                collect_gate_outputs=True,
-            )
 
-        # hooks_data 흡수(루트/서브 모든 위치 허용)
-        hooks_data: Dict[str, Any] = {}
-        w_hooks = direct.pop("hooks_data", None)
-        if isinstance(w_hooks, dict) and w_hooks:
-            hooks_data.update(w_hooks)
-        for k in ("gate_outputs","gru_states","gates_by_stage","gate_by_stage","gate_logs_by_stage"):
-            if k in direct and k not in hooks_data:
-                hooks_data[k] = direct[k]
+        hooks_data = {}
+        # ★ W3: 게이트도 수집한다
+        direct = evaluate_with_direct_evidence(
+            self.model, self.test_loader, self.mu, self.std,
+            tod_vec=tod_vec, device=self.device,
+            collect_gate_outputs=True
+        )
 
-        # (선택) 공통 특화 지표가 있다면 병합 – W3는 per-run 단계에서 Δ를 계산하지 않음
+        # direct → hooks_data 병합
+        w2_hooks = direct.pop("hooks_data", None)
+        if w2_hooks:
+            hooks_data.update(w2_hooks or {})
+
+        # ★ W3: 스테이지 산발 키(gate_log_s/m/d) 흡수 → gates_by_stage 구성
+        gbs = {}
+        for k, st in [("gate_log_s","S"),("gate_log_m","M"),("gate_log_d","D")]:
+            if k in direct and direct[k] is not None:
+                gbs[st] = direct[k]
+        if gbs:
+            hooks_data.setdefault("gates_by_stage", {}).update(gbs)
+
+        # W3 특화 지표(필요 시): all_metrics로 위임
+        direct_evidence = direct.copy()
         try:
-            extra = compute_all_experiment_metrics(
-                experiment_type=self.experiment_type,
+            from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
+            exp_specific = compute_all_experiment_metrics(
+                experiment_type="W3",
                 model=self.model,
                 hooks_data=hooks_data if hooks_data else None,
                 tod_vec=tod_vec,
-                direct_evidence=direct,
-                perturbation_type=self.cfg.get("mode", "none"),
-                active_layers=[],
+                direct_evidence=direct_evidence,
+                perturbation_type=self.cfg.get("mode","none"),  # 'none'|'tod_shift'|'smooth'
             )
-            if isinstance(extra, dict):
-                for k, v in extra.items():
-                    direct[k] = v
-        except Exception:
+            for k, v in exp_specific.items():
+                direct[k] = v
+        except ImportError:
             pass
 
+        # 보고용 그림 지표 계산 (w3_plotting_metrics.compute_experiment_plotting_metrics 호출)
+        plotting_metrics = {}
+        small_loader = torch.utils.data.DataLoader(
+            self.test_loader.dataset,
+            batch_size=min(16, self.cfg.get("batch_size", 128)),
+            shuffle=False, num_workers=0
+        )
+        try:
+            from importlib import import_module
+            module = import_module("utils.experiment_plotting_metrics.w3_plotting_metrics")
+            compute_fn = getattr(module, "compute_experiment_plotting_metrics", None)
+            if callable(compute_fn):
+                plotting_metrics = compute_fn(
+                    model=self.model,
+                    loader=small_loader,
+                    mu=self.mu, std=self.std,
+                    tod_vec=tod_vec,
+                    device=self.device,
+                    hooks_data=hooks_data,
+                    cfg=self.cfg,
+                ) or {}
+        except ImportError:
+            plotting_metrics = {}
+
+        for k, v in (plotting_metrics or {}).items():
+            direct[k] = v
+
+        self._plotting_payload = plotting_metrics
         self._last_hooks_data = copy.deepcopy(hooks_data)
         self._last_direct = copy.deepcopy(direct)
         return direct
