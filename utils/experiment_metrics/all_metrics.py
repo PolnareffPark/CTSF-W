@@ -14,39 +14,28 @@ def compute_all_experiment_metrics(
     hooks_data: Optional[Dict] = None,
     **kwargs
 ) -> Dict:
-    """
-    실험 타입에 따라 특화 지표 계산.
-    W3의 기본 Δ 집계는 그림 재작성(rebuild_*) 단계에서 수행.
-    """
-    et = (experiment_type or "").upper()
-    if et == "W1":
+    if experiment_type == "W1":
         return compute_w1_metrics(model, hooks_data, kwargs.get("tod_vec"))
-    if et == "W2":
+    if experiment_type == "W2":
         return compute_w2_metrics(
             model=model,
             hooks_data=hooks_data,
             tod_vec=kwargs.get("tod_vec"),
-            direct_evidence=kwargs.get("direct_evidence"),
+            direct_evidence=kwargs.get("direct_evidence")
         )
-    if et == "W3":
-        base = kwargs.get("baseline_metrics")
-        pert = kwargs.get("perturb_metrics")
-        if isinstance(base, dict) and isinstance(pert, dict):
-            return compute_w3_metrics(
-                baseline_metrics=base,
-                perturb_metrics=pert,
-                win_errors_base=kwargs.get("win_errors_base"),
-                win_errors_pert=kwargs.get("win_errors_pert"),
-                dz_ci=kwargs.get("w3_dz_ci", False),
-            )
-        # 단독 실행 시에는 페어 없음 → 빈 dict
+    if experiment_type == "W3":
+        # per-run 단계에서는 Δ를 계산하지 않음(집계 단계 전담)
+        # baseline/perturb 한 쌍을 확보해 호출하고 싶다면 아래 주석을 활성화
+        # return compute_w3_metrics(
+        #     baseline_metrics=kwargs.get("baseline_metrics"),
+        #     perturb_metrics=kwargs.get("perturb_metrics"),
+        #     win_errors_base=kwargs.get("win_errors_base"),
+        #     win_errors_pert=kwargs.get("win_errors_pert"),
+        #     dz_ci=kwargs.get("w3_dz_ci", False)
+        # )
         return {}
-    if et == "W4":
+    if experiment_type == "W4":
         return compute_w4_metrics(model, hooks_data, kwargs.get("active_layers", []))
-    if et == "W5":
-        return compute_w5_metrics(
-            model,
-            kwargs.get("fixed_model_metrics"),
-            kwargs.get("dynamic_model_metrics")
-        )
+    if experiment_type == "W5":
+        return compute_w5_metrics(model, kwargs.get("fixed_model_metrics"), kwargs.get("dynamic_model_metrics"))
     return {}

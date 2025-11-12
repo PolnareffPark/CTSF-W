@@ -9,43 +9,32 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import math
+import time
 import numpy as np
 import pandas as pd
 
-# 공통 키(모든 행 강제): experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag
 _W3_KEYS = [
-    "experiment_type","dataset","plot_type","horizon","seed","mode","model_tag","run_tag"
+    "experiment_type","dataset","plot_type","horizon","seed",
+    "mode","perturbation","model_tag","run_tag"
 ]
 
 # ---------------------------
 # 공통 유틸 (W1/W2와 동일 정책)
 # ---------------------------
 def _ensure_dir(p: str | Path) -> Path:
-    p = Path(p)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
+    p = Path(p); p.parent.mkdir(parents=True, exist_ok=True); return p
 
 def _atomic_write_csv(df: pd.DataFrame, path: str | Path) -> None:
-    path = _ensure_dir(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_csv(tmp, index=False)
-    tmp.replace(path)
+    path = _ensure_dir(path); tmp = path.with_suffix(path.suffix + f".tmp{int(time.time()*1000)}")
+    df.to_csv(tmp, index=False); tmp.replace(path)
 
 def _append_or_update_row(csv_path: str | Path, row: Dict[str,Any], subset_keys: List[str]) -> None:
-    path = _ensure_dir(csv_path)
-    new = pd.DataFrame([row])
+    path = _ensure_dir(csv_path); new = pd.DataFrame([row])
     if path.exists():
         old = pd.read_csv(path)
-        # 컬럼 합집합
-        for c in new.columns:
-            if c not in old.columns: old[c] = np.nan
-        for c in old.columns:
-            if c not in new.columns: new[c] = np.nan
-        # 키 매칭 제거 후 추가
-        mask = np.ones(len(old), dtype=bool)
         if len(old)>0 and all(k in old.columns for k in subset_keys):
-            for k in subset_keys:
-                mask &= (old[k] == row[k])
+            mask = np.ones(len(old), dtype=bool)
+            for k in subset_keys: mask &= (old[k] == row[k])
             old = pd.concat([old[~mask], new], ignore_index=True)
         else:
             old = pd.concat([old, new], ignore_index=True)
@@ -55,8 +44,7 @@ def _append_or_update_row(csv_path: str | Path, row: Dict[str,Any], subset_keys:
 
 def _append_or_update_rows(csv_path: str | Path, rows: List[Dict[str,Any]], subset_keys: List[str]) -> None:
     if not rows: return
-    path = _ensure_dir(csv_path)
-    new = pd.DataFrame(rows)
+    path = _ensure_dir(csv_path); new = pd.DataFrame(rows)
     if path.exists():
         old = pd.read_csv(path)
         for c in new.columns:
@@ -73,7 +61,8 @@ def _append_or_update_rows(csv_path: str | Path, rows: List[Dict[str,Any]], subs
 def _to_f32(v: Any, ndigits: int = 6) -> float:
     try:
         f = float(v); 
-        return float(np.round(np.float32(f), ndigits)) if np.isfinite(f) else np.nan
+        if not np.isfinite(f): return np.nan
+        return float(np.round(np.float32(f), ndigits))
     except Exception:
         return np.nan
 
@@ -223,14 +212,11 @@ def mode_to_perturbation(mode: str) -> str:
     return "NONE"
 
 def save_w3_forest_detail_row(
-    ctx: Dict[str,Any],   # plot_type='forest_plot', mode ∈ {'none','tod_shift','smooth'}
-    rmse_real: float,
-    mae_real: float,
+    ctx: Dict[str,Any], rmse_real: float, mae_real: float,
     detail_csv: str | Path
 ) -> None:
     row = {
         **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-        "perturbation": mode_to_perturbation(ctx.get("mode","")),
         "rmse_real": _to_f32(rmse_real),
         "mae_real":  _to_f32(mae_real),
     }
@@ -244,68 +230,44 @@ def _ci_mean(a: np.ndarray) -> float:
 def rebuild_w3_forest_summary(
     detail_csv: str | Path,
     summary_csv: str | Path,
-    gate_tod_summary_csv: Optional[str | Path] = None,
-    gate_dist_summary_csv: Optional[str | Path] = None,
-    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon","perturbation")
+    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon","perturbation"),
+    baseline_mode: str = "none"
 ) -> pd.DataFrame:
     detail_csv = Path(detail_csv)
     if not detail_csv.exists():
-        out = pd.DataFrame(columns=list(group_keys)+["n_pairs","delta_rmse_mean","delta_mae_mean","delta_tod_mean","delta_var_time_mean"])
-        _atomic_write_csv(out, summary_csv)
-        return out
-
+        out = pd.DataFrame(columns=list(group_keys)+["n_pairs","delta_rmse_mean","delta_rmse_pct_mean","delta_mae_mean"])
+        _atomic_write_csv(out, summary_csv); return out
     df = pd.read_csv(detail_csv)
-    need = set(group_keys)|{"seed","mode","rmse_real","mae_real"}
+    need = set(group_keys) | {"seed","mode","rmse_real","mae_real"}
     miss = [c for c in need if c not in df.columns]
     if miss:
-        raise ValueError(f"Missing columns in forest detail: {miss}")
+        raise ValueError(f"Missing columns in W3 forest detail: {miss}")
 
-    # baseline vs perturbed pair 매칭
-    base = df[df["mode"]=="none"].copy()
-    per  = df[df["mode"].isin(["tod_shift","smooth"])].copy()
-    if len(per)==0:
-        out = pd.DataFrame(columns=list(group_keys)+["n_pairs","delta_rmse_mean","delta_mae_mean","delta_tod_mean","delta_var_time_mean"])
-        _atomic_write_csv(out, summary_csv)
-        return out
+    # baseline=none, perturbed={tod_shift|smooth}
+    base = df[df["mode"]==baseline_mode].copy()
+    pert = df[df["mode"]!=baseline_mode].copy()
 
-    # perturbation label 추가
-    per["perturbation"] = per["mode"].map(mode_to_perturbation)
-    on = ["experiment_type","dataset","horizon","seed"]
-    base["perturbation"] = "TOD"  # dummy; merge 후 per의 label 사용
-    merged = per.merge(base[on+["rmse_real","mae_real"]], on=on, suffixes=("_per","_base"))
-    # Δ 계산
-    merged["delta_rmse"] = (merged["rmse_real_per"] - merged["rmse_real_base"]).astype(np.float32)
-    merged["delta_mae"]  = (merged["mae_real_per"]  - merged["mae_real_base"]).astype(np.float32)
+    on = list(group_keys) + ["seed"]
+    merged = pert.merge(base[on + ["rmse_real","mae_real"]], on=on, suffixes=("", "_base"))
 
-    # (선택) 게이트 보조 조인
-    if gate_tod_summary_csv and Path(gate_tod_summary_csv).exists():
-        tdf = pd.read_csv(gate_tod_summary_csv)
-        need_t = {"experiment_type","dataset","horizon","seed","mode","tod_amp_mean"}
-        if need_t.issubset(set(tdf.columns)):
-            t_per  = tdf[tdf["mode"].isin(["tod_shift","smooth"])][["experiment_type","dataset","horizon","seed","tod_amp_mean"]].rename(columns={"tod_amp_mean":"tod_amp_mean_per"})
-            t_base = tdf[tdf["mode"]=="none"][["experiment_type","dataset","horizon","seed","tod_amp_mean"]].rename(columns={"tod_amp_mean":"tod_amp_mean_base"})
-            merged = merged.merge(t_per,  on=on, how="left").merge(t_base, on=on, how="left")
-            merged["delta_tod"] = (merged["tod_amp_mean_per"] - merged["tod_amp_mean_base"]).astype(np.float32)
+    if len(merged)==0:
+        out = pd.DataFrame(columns=list(group_keys)+["n_pairs","delta_rmse_mean","delta_rmse_pct_mean","delta_mae_mean"])
+        _atomic_write_csv(out, summary_csv); return out
 
-    if gate_dist_summary_csv and Path(gate_dist_summary_csv).exists():
-        vdf = pd.read_csv(gate_dist_summary_csv)
-        if {"experiment_type","dataset","horizon","seed","mode","w2_gate_variability_time"}.issubset(set(vdf.columns)):
-            v_per  = vdf[vdf["mode"].isin(["tod_shift","smooth"])][["experiment_type","dataset","horizon","seed","w2_gate_variability_time"]].rename(columns={"w2_gate_variability_time":"var_time_per"})
-            v_base = vdf[vdf["mode"]=="none"][["experiment_type","dataset","horizon","seed","w2_gate_variability_time"]].rename(columns={"w2_gate_variability_time":"var_time_base"})
-            merged = merged.merge(v_per, on=on, how="left").merge(v_base, on=on, how="left")
-            merged["delta_var_time"] = (merged["var_time_per"] - merged["var_time_base"]).astype(np.float32)
+    merged["delta_rmse"]     = (merged["rmse_real"] - merged["rmse_real_base"]).astype(np.float32)
+    merged["delta_rmse_pct"] = (merged["delta_rmse"] / merged["rmse_real_base"]).astype(np.float32) * 100.0
+    merged["delta_mae"]      = (merged["mae_real"]  - merged["mae_real_base"]).astype(np.float32)
 
-    # 집계
-    rows: List[Dict[str,Any]] = []
-    for gvals, gdf in merged.groupby(list(group_keys), group_keys=False):
-        rows.append({
+    rows = []
+    for gvals, gdf in merged.groupby(list(group_keys)):
+        row = {
             **{k:v for k,v in zip(group_keys,gvals)},
             "n_pairs": int(len(gdf)),
-            "delta_rmse_mean":     _ci_mean(gdf["delta_rmse"].values.astype(np.float64)),
-            "delta_mae_mean":      _ci_mean(gdf["delta_mae"].values.astype(np.float64)),
-            "delta_tod_mean":      _ci_mean(gdf["delta_tod"].values.astype(np.float64)) if "delta_tod" in gdf.columns else np.nan,
-            "delta_var_time_mean": _ci_mean(gdf["delta_var_time"].values.astype(np.float64)) if "delta_var_time" in gdf.columns else np.nan,
-        })
+            "delta_rmse_mean":     _to_f32(np.mean(gdf["delta_rmse"].values)),
+            "delta_rmse_pct_mean": _to_f32(np.mean(gdf["delta_rmse_pct"].values)),
+            "delta_mae_mean":      _to_f32(np.mean(gdf["delta_mae"].values)),
+        }
+        rows.append(row)
     out = pd.DataFrame(rows)
     _atomic_write_csv(out, summary_csv)
     return out
@@ -317,86 +279,77 @@ def rebuild_w3_forest_summary(
 #   source: results/results_W3.csv (baseline/perturbed run raw)
 # ============================================================
 
-_TOD_KEYS  = ["gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2"]
-_PEAK_KEYS = ["cg_event_gain","cg_spearman_mean","cg_bestlag"]  # |lag|는 집계에서 abs 처리
+_TOD_METRICS = ["gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2"]
+_PEAK_METRICS = ["cg_event_gain","abs_cg_bestlag","cg_spearman_mean"]
 
-def rebuild_w3_perturb_delta_summary(
-    results_w3_csv: str | Path,
-    out_dir: str | Path,   # results/results_W3/<dataset>/perturb_delta_bar/
-    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon","perturbation")
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    results_w3_csv = Path(results_w3_csv)
-    if not results_w3_csv.exists():
-        # 빈 파일 생성
-        empty = pd.DataFrame(columns=list(group_keys)+["metric","delta","seed"])
-        _atomic_write_csv(empty, Path(out_dir)/"perturb_delta_bar_detail.csv")
-        _atomic_write_csv(pd.DataFrame(columns=list(group_keys)+["metric","delta_mean"]), Path(out_dir)/"perturb_delta_bar_summary.csv")
-        return empty, pd.DataFrame()
+def save_w3_perturb_delta_detail(
+    results_csv: str | Path,
+    out_detail_csv: str | Path,
+    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon","perturbation"),
+    baseline_mode: str = "none"
+) -> pd.DataFrame:
+    results_csv = Path(results_csv)
+    if not results_csv.exists():
+        _atomic_write_csv(pd.DataFrame(columns=list(group_keys)+["metric","seed","delta"]), out_detail_csv)
+        return pd.DataFrame()
 
-    df = pd.read_csv(results_w3_csv)
-    need = {"experiment_type","dataset","horizon","seed","mode"}
+    df = pd.read_csv(results_csv)
+    need = set(group_keys) | {"mode","seed"}
     miss = [c for c in need if c not in df.columns]
     if miss:
         raise ValueError(f"Missing columns in results_W3.csv: {miss}")
 
-    # baseline/perturbed 분리
-    base = df[df["mode"]=="none"].copy()
-    per  = df[df["mode"].isin(["tod_shift","smooth"])].copy()
-    if len(per)==0:
-        empty = pd.DataFrame(columns=list(group_keys)+["metric","delta","seed"])
-        _atomic_write_csv(empty, Path(out_dir)/"perturb_delta_bar_detail.csv")
-        _atomic_write_csv(pd.DataFrame(columns=list(group_keys)+["metric","delta_mean"]), Path(out_dir)/"perturb_delta_bar_summary.csv")
-        return empty, pd.DataFrame()
+    # abs(cg_bestlag) 파생
+    if "cg_bestlag" in df.columns and "abs_cg_bestlag" not in df.columns:
+        try:
+            df["abs_cg_bestlag"] = df["cg_bestlag"].abs().astype(float)
+        except Exception:
+            df["abs_cg_bestlag"] = np.nan
 
-    per["perturbation"] = per["mode"].map(mode_to_perturbation)
-    on = ["experiment_type","dataset","horizon","seed"]
-    merged = per.merge(base[on+_TOD_KEYS+_PEAK_KEYS], on=on, suffixes=("_per","_base"))
+    base = df[df["mode"]==baseline_mode].copy()
+    pert = df[df["mode"]!=baseline_mode].copy()
+    on = list(group_keys) + ["seed"]
+    merged = pert.merge(base[on + _TOD_METRICS + _PEAK_METRICS], on=on, suffixes=("", "_base"))
 
-    # Δ 계산
-    rows: List[Dict[str,Any]] = []
-    for idx, r in merged.iterrows():
-        ctx = {k:r[k] for k in on}
-        pert = r["perturbation"]
-        # A4‑TOD
-        if pert=="TOD":
-            for k in _TOD_KEYS:
-                a = r[f"{k}_per"]; b = r[f"{k}_base"]
-                delta = np.nan
-                try:
-                    a = float(a); b = float(b)
-                    delta = a - b
-                except Exception:
-                    pass
-                rows.append({**ctx, "perturbation": pert, "metric": k, "delta": _to_f32(delta), "seed": int(r["seed"])})
-        # A4‑PEAK
-        if pert=="PEAK":
-            # event_gain, spearman
-            for k in ["cg_event_gain","cg_spearman_mean"]:
-                a = r[f"{k}_per"]; b = r[f"{k}_base"]
-                delta = np.nan
-                try:
-                    a = float(a); b = float(b)
-                    delta = a - b
-                except Exception:
-                    pass
-                rows.append({**ctx, "perturbation": pert, "metric": k, "delta": _to_f32(delta), "seed": int(r["seed"])})
-            # |bestlag|
-            try:
-                a = float(r["cg_bestlag_per"]); b = float(r["cg_bestlag_base"])
-                delta = abs(a) - abs(b)
-            except Exception:
-                delta = np.nan
-            rows.append({**ctx, "perturbation": pert, "metric": "abs_cg_bestlag", "delta": _to_f32(delta), "seed": int(r["seed"])})
-    detail = pd.DataFrame(rows)
-    _atomic_write_csv(detail, Path(out_dir)/"perturb_delta_bar_detail.csv")
+    rows = []
+    for gvals, gdf in merged.groupby(list(group_keys)):
+        pert_tag = gvals[-1]
+        use_metrics = _TOD_METRICS if str(pert_tag)=="TOD" else _PEAK_METRICS
+        for _, r in gdf.iterrows():
+            for m in use_metrics:
+                if m not in gdf.columns or f"{m}_base" not in gdf.columns: 
+                    continue
+                dv = _to_f32(r[m]) - _to_f32(r[f"{m}_base"])
+                rows.append({
+                    **{k:v for k,v in zip(group_keys,gvals)},
+                    "metric": m, "seed": int(r["seed"]),
+                    "delta": _to_f32(dv)
+                })
+    out = pd.DataFrame(rows)
+    _atomic_write_csv(out, out_detail_csv)
+    return out
 
-    # summary
-    rows2: List[Dict[str,Any]] = []
-    for gvals, gdf in detail.groupby(list(group_keys)+["metric"], group_keys=False):
-        rows2.append({
-            **{k:v for k,v in zip(list(group_keys)+["metric"], gvals)},
-            "delta_mean": _to_f32(float(np.nanmean(gdf["delta"].values.astype(np.float64))))
-        })
-    summ = pd.DataFrame(rows2)
-    _atomic_write_csv(summ, Path(out_dir)/"perturb_delta_bar_summary.csv")
-    return detail, summ
+def rebuild_w3_perturb_delta_summary(
+    detail_csv: str | Path,
+    summary_csv: str | Path,
+    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon","perturbation")
+) -> pd.DataFrame:
+    detail_csv = Path(detail_csv)
+    if not detail_csv.exists():
+        _atomic_write_csv(pd.DataFrame(columns=list(group_keys)+["metric","delta_mean"]), summary_csv)
+        return pd.DataFrame()
+    df = pd.read_csv(detail_csv)
+    need = set(group_keys) | {"metric","delta"}
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise ValueError(f"Missing columns in perturb_delta_bar_detail.csv: {miss}")
+
+    rows = []
+    for gvals, gdf in df.groupby(list(group_keys)+["metric"], group_keys=False):
+        # 평균치(필요시 CI 추가 가능)
+        delta_mean = _to_f32(np.mean(gdf["delta"].values.astype(np.float64)))
+        row = {**{k:v for k,v in zip(list(group_keys)+["metric"], gvals)}, "delta_mean": delta_mean}
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    _atomic_write_csv(out, summary_csv)
+    return out
