@@ -1,0 +1,3 @@
+experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag,tod_bins,tod_amp_s,tod_amp_m,tod_amp_d,tod_amp_mean,valid_ratio,nan_count,amp_method
+W2,ETTh1,gate_tod_heatmap,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,24,0.0001900000061141,0.0007270000060088,0.0045699998736381,0.0018289999570697,0.7916669845581055,15,range
+W2,ETTh1,gate_tod_heatmap,96,42,static,HyperConv,W2_ETTh1_96_42_static,24,0.0017610000213608146,0.0013559999642893672,0.0009640000062063336,0.0013599999947473407,0.7916669845581055,15,range

@@ -1,0 +1,15 @@
+experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag,stat,value
+W2,ETTh1,gate_distribution,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,gate_q05,0.0480599999427795
+W2,ETTh1,gate_distribution,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,gate_q10,0.049440998584032
+W2,ETTh1,gate_distribution,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,gate_q25,0.0497080013155937
+W2,ETTh1,gate_distribution,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,gate_q50,0.4936540126800537
+W2,ETTh1,gate_distribution,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,gate_q75,0.9445459842681884
+W2,ETTh1,gate_distribution,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,gate_q90,0.947314977645874
+W2,ETTh1,gate_distribution,96,42,dynamic,HyperConv,W2_ETTh1_96_42_dynamic,gate_q95,0.9475359916687012
+W2,ETTh1,gate_distribution,96,42,static,HyperConv,W2_ETTh1_96_42_static,gate_q05,0.048652999103069305
+W2,ETTh1,gate_distribution,96,42,static,HyperConv,W2_ETTh1_96_42_static,gate_q10,0.04879099875688553
+W2,ETTh1,gate_distribution,96,42,static,HyperConv,W2_ETTh1_96_42_static,gate_q25,0.049713000655174255
+W2,ETTh1,gate_distribution,96,42,static,HyperConv,W2_ETTh1_96_42_static,gate_q50,0.49707698822021484
+W2,ETTh1,gate_distribution,96,42,static,HyperConv,W2_ETTh1_96_42_static,gate_q75,0.9457409977912903
+W2,ETTh1,gate_distribution,96,42,static,HyperConv,W2_ETTh1_96_42_static,gate_q90,0.9474449753761292
+W2,ETTh1,gate_distribution,96,42,static,HyperConv,W2_ETTh1_96_42_static,gate_q95,0.9481909871101379
