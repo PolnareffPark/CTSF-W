@@ -203,6 +203,23 @@ class _W3PerturbWrapper(nn.Module):
                 break
         return self.base(*args, **kwargs)
 
+    def __getattr__(self, name):
+        """base 모델의 속성에 투명하게 접근 (무한 재귀 방지)"""
+        # object.__getattribute__를 사용하여 _modules['base']에 직접 접근
+        # 이는 __getattr__를 우회하므로 무한 재귀를 방지함
+        try:
+            # nn.Module은 서브모듈을 _modules dict에 저장
+            modules = object.__getattribute__(self, '_modules')
+            base = modules['base']
+        except (AttributeError, KeyError):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        
+        # base 모델의 속성으로 위임
+        try:
+            return getattr(base, name)
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
 
 # ---------------------------
 # 실험 본체
@@ -347,7 +364,7 @@ class W3Experiment(BaseExperiment):
         horizon = int(self.cfg.get("horizon", 96))
         seed    = int(self.cfg.get("seed", 42))
         mode    = str(self.cfg.get("mode", "none"))
-        model_tag = getattr(self.model.base, "model_tag", "HyperConv")
+        model_tag = getattr(self.model, "model_tag", "HyperConv")
         run_tag   = f"{EXP_TAG}_{dataset}_{horizon}_{seed}_{mode}"
 
         try:
