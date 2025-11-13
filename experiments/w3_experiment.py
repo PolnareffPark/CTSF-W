@@ -1,48 +1,40 @@
 # ============================================================
 # experiments/w3_experiment.py
-#   - W3: 데이터 구조 원인 확인 (none / tod_shift / smooth)
-#   - per-run: 원자료 저장 (results_W3.csv, gate_* CSV들) → 사후 집계에서 Δ
+#   - W3: 데이터 구조 원인 확인 (학습-교란 / 평가-클린)
+#   - none | tod_shift | smooth
+#   - 결과 저장: results/results_W3.csv (+ 3 그림 summary/detail)
 # ============================================================
 
 from __future__ import annotations
-
 import copy
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
+import torch.nn as nn
+
 from .base_experiment import BaseExperiment
 from data.dataset import build_test_tod_vector
 from models.ctsf_model import HybridTS
-
-# (W3는 모델 구조 동일: 동적 교차 모델. 데이터 교란은 loader/전처리에 의해 이뤄짐)
-# W1/W2에 영향 없도록 W3에서만 사용
 from utils.direct_evidence import evaluate_with_direct_evidence
-from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
 
-# W3 전용 그림 저장 유틸(요약/상세)
 from utils.experiment_plotting_metrics.w3_plotting_metrics import (
-    save_w3_forest_detail_row,
-    rebuild_w3_forest_summary,
     compute_and_save_w3_gate_tod_heatmap,
     compute_and_save_w3_gate_distribution,
-    rebuild_w3_perturb_delta_bar,   # Δ 지표 집계
-)
-
-# (간단한 게이트 패키징 유틸 – W3 전용)
-from utils.experiment_plotting_metrics.all_plotting_metrics import (
-    infer_tod_bins_by_dataset,
+    save_w3_forest_detail_row,
+    rebuild_w3_forest_summary,
+    rebuild_w3_perturb_delta_bar,
 )
 
 RESULTS_ROOT = Path("results")
 EXP_TAG = "W3"
-MODES = ("none", "tod_shift", "smooth")  # README/계획과 동일
+PERTURB_MODES = ("none", "tod_shift", "smooth")
 
 
 # ---------------------------
-# 공통 유틸
+# 내부 유틸
 # ---------------------------
 def _ensure_dir(p: str | Path) -> Path:
     p = Path(p)
@@ -50,255 +42,240 @@ def _ensure_dir(p: str | Path) -> Path:
     return p
 
 
-_CG_GC_KEYS = [
-    # conv->gru 상호작용(cg_*), gru->conv 민감도(gc_*) 핵심 지표
-    "cg_pearson_mean", "cg_spearman_mean", "cg_dcor_mean",
-    "cg_event_gain", "cg_event_hit", "cg_maxcorr", "cg_bestlag",
-    "gc_kernel_tod_dcor", "gc_feat_tod_dcor", "gc_feat_tod_r2",
-    "gc_kernel_feat_dcor", "gc_kernel_feat_align",
-    # 분산 등 로그형 지표(있으면 흡수)
-    "mse_std","mae_std"
-]
+def _append_or_update_results(csv_path: str | Path, row: Dict[str, Any], subset: List[str]) -> None:
+    import pandas as pd
+    path = _ensure_dir(csv_path)
+    new = pd.DataFrame([row])
+    if path.exists():
+        old = pd.read_csv(path)
+        # 컬럼 union
+        for c in new.columns:
+            if c not in old.columns:
+                old[c] = np.nan
+        for c in old.columns:
+            if c not in new.columns:
+                new[c] = np.nan
+        df = pd.concat([old, new], ignore_index=True)
+        df.drop_duplicates(subset=subset, keep="last", inplace=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        df.to_csv(tmp, index=False)
+        tmp.replace(path)
+    else:
+        new.drop_duplicates(subset=subset, keep="last", inplace=True)
+        new.to_csv(path, index=False)
 
-def _merge_cg_gc(row: dict, de: Optional[dict]) -> dict:
-    if not isinstance(de, dict):
-        return row
-    for k in _CG_GC_KEYS:
-        if k in de:
-            try:
-                row[k] = float(de[k])
-            except Exception:
-                row[k] = de[k]
-    return row
 
-class _TODShiftWrapper:
-    def __init__(self, base, dataset_tag: str, max_shift: int = 8):
-        self.base = base; self.dataset_tag = (dataset_tag or "").lower(); self.max_shift = int(max_shift)
-    def __len__(self): return len(self.base)
-    def __getitem__(self, idx):
-        import numpy as np, torch
-        it = self.base[idx]
-        if not isinstance(it, (list,tuple)) or len(it)<2: return it
-        x, y = it[0], it[1]
-        arr = x.detach().cpu().numpy() if hasattr(x,"detach") else np.asarray(x)
-        # 시간축 추정
-        expected = {96} if "ettm" in self.dataset_tag else ({24} if "etth" in self.dataset_tag else {144})
-        cand = [i for i,sz in enumerate(arr.shape) if sz in expected] or [i for i,sz in enumerate(arr.shape) if sz>=12]
-        t_axis = cand[0] if cand else (arr.ndim-1)
-        shift = np.random.randint(-self.max_shift, self.max_shift+1)
-        arr = np.roll(arr, shift=shift, axis=t_axis)
-        x2 = torch.as_tensor(arr, dtype=x.dtype, device=x.device) if hasattr(x,"detach") else arr
-        return (x2, y, *it[2:])
+def _infer_tod_bins(dataset: str) -> int:
+    ds = (dataset or "").lower()
+    if "ettm" in ds:
+        return 96
+    if "etth" in ds:
+        return 24
+    if "weather" in ds:
+        return 144
+    return 24
 
-class _SmoothWrapper:
-    def __init__(self, base, dataset_tag: str, win: int = 5):
-        self.base = base; self.dataset_tag = (dataset_tag or "").lower(); self.win = int(win if win%2==1 else win+1)
-    def __len__(self): return len(self.base)
-    def __getitem__(self, idx):
-        import numpy as np, torch
-        it = self.base[idx]
-        if not isinstance(it, (list,tuple)) or len(it)<2: return it
-        x, y = it[0], it[1]
-        arr = x.detach().cpu().numpy() if hasattr(x,"detach") else np.asarray(x)
-        expected = {96} if "ettm" in self.dataset_tag else ({24} if "etth" in self.dataset_tag else {144})
-        cand = [i for i,sz in enumerate(arr.shape) if sz in expected] or [i for i,sz in enumerate(arr.shape) if sz>=12]
-        t_axis = cand[0] if cand else (arr.ndim-1)
-        # 간단 이동평균
-        k = self.win; ker = np.ones(k, dtype=float)/k; pad=k//2
-        arr_mv = np.moveaxis(arr, t_axis, -1); shp=arr_mv.shape
-        flat = arr_mv.reshape(-1, shp[-1])
-        # reflect padding
-        left  = flat[:,1:pad+1][:, ::-1]; right = flat[:,-pad-1:-1][:, ::-1]
-        paded = np.concatenate([left, flat, right], axis=1)
-        sm = np.apply_along_axis(lambda v: np.convolve(v, ker, mode="valid"), 1, paded).reshape(shp)
-        sm = np.moveaxis(sm, -1, t_axis)
-        x2 = torch.as_tensor(sm, dtype=x.dtype, device=x.device) if hasattr(x,"detach") else sm
-        return (x2, y, *it[2:])
 
-# ============================================================
-# W3 Experiment
-# ============================================================
+# ---------------------------
+# 학습-시행시 입력 교란 래퍼
+# ---------------------------
+class _W3PerturbWrapper(nn.Module):
+    """
+    학습시에만 입력(첫 번째 텐서)을 교란하고, 평가/테스트에선 그대로 통과.
+    모델 시그니처는 (*args, **kwargs) 그대로 유지. 입력 텐서 시간축을 자동 감지.
+    """
+    def __init__(self, base: nn.Module, cfg: Dict[str, Any]):
+        super().__init__()
+        self.base = base
+        self.cfg = cfg
+        self.mode = str(cfg.get("perturbation", "none"))
+
+        # 교란 강도(CTSF 012 분석 요지 반영)
+        ds = str(cfg.get("dataset", "")).lower()
+        if self.mode == "tod_shift":
+            # ETTm2: 15min → 1~2h = 4~8 스텝; 약간 강화해서 4~12
+            self.roll_min, self.roll_max = (4, 12) if "ettm2" in ds else (1, 4)
+        elif self.mode == "smooth":
+            # ETTh2: 피크 완화(5-tap, 부드럽게, 피크 감소 ~15~25%)
+            self.smooth_kernel = torch.tensor([1, 4, 6, 4, 1], dtype=torch.float32)
+            self.smooth_kernel = self.smooth_kernel / self.smooth_kernel.sum()
+        else:
+            self.roll_min, self.roll_max = (0, 0)
+            self.smooth_kernel = None
+
+        self.seq_len = int(cfg.get("seq_len", 0))
+
+    def _find_time_axis(self, x: torch.Tensor) -> int:
+        # seq_len 힌트가 있으면 거기에 맞춤. 없으면 가장 긴 축(배치축 제외) 추정.
+        if self.seq_len > 0:
+            for ax, sz in enumerate(x.shape):
+                if sz == self.seq_len:
+                    return ax
+        # B, T, C  or B, C, T 가 일반적
+        # 배치축(0)을 제외한 가장 큰 축을 시간축으로 가정
+        dims = list(range(x.ndim))
+        if x.ndim >= 3:
+            candidates = [ax for ax in dims[1:] if x.shape[ax] >= 12]
+            if len(candidates) > 0:
+                # 가장 긴 축
+                return max(candidates, key=lambda a: x.shape[a])
+        return x.ndim - 1  # 마지막 축 fall-back
+
+    @torch.no_grad()
+    def _apply_tod_shift(self, x: torch.Tensor) -> torch.Tensor:
+        if self.roll_max <= 0:
+            return x
+        t_ax = self._find_time_axis(x)
+        # (B,...,T,...) 형태로 bring
+        perm = list(range(x.ndim))
+        if t_ax != -1 and t_ax != x.ndim - 1:
+            perm[t_ax], perm[-1] = perm[-1], perm[t_ax]
+            x = x.permute(*perm)
+        B, *rest, T = x.shape
+        if B <= 0 or T <= 2:
+            # 되돌려 놓고 반환
+            if t_ax != -1 and t_ax != x.ndim - 1:
+                inv = [0]*len(perm)
+                for i,p in enumerate(perm): inv[p]=i
+                x = x.permute(*inv)
+            return x
+
+        # 배치별로 다른 roll
+        shifts = torch.randint(low=self.roll_min, high=self.roll_max+1, size=(B,), device=x.device)
+        signs  = torch.randint(low=0, high=2, size=(B,), device=x.device) * 2 - 1  # {-1, +1}
+        svec   = (shifts * signs).tolist()
+        xs = []
+        for b in range(B):
+            xs.append(torch.roll(x[b], shifts=int(svec[b]), dims=-1))
+        x2 = torch.stack(xs, dim=0)
+
+        # 원래 축으로 복귀
+        if t_ax != -1 and t_ax != x.ndim - 1:
+            inv = [0]*len(perm)
+            for i,p in enumerate(perm): inv[p]=i
+            x2 = x2.permute(*inv)
+        return x2
+
+    @torch.no_grad()
+    def _apply_smooth(self, x: torch.Tensor) -> torch.Tensor:
+        if self.smooth_kernel is None or x.ndim < 3:
+            return x
+        t_ax = self._find_time_axis(x)
+        perm = list(range(x.ndim))
+        if t_ax != -1 and t_ax != x.ndim - 1:
+            perm[t_ax], perm[-1] = perm[-1], perm[t_ax]
+            x = x.permute(*perm)
+        # 이제 (..., T) 가 마지막 축
+        # Conv1d를 쓰려면 (B*C,1,T) 형식으로
+        B = x.shape[0]
+        T = x.shape[-1]
+        C = int(np.prod(x.shape[1:-1])) if x.ndim > 3 else x.shape[-2]
+        x_ = x.reshape(B, C, T)
+
+        k = self.smooth_kernel.to(x_.device, dtype=x_.dtype).view(1, 1, -1)
+        pad = k.shape[-1] // 2
+        x_pad = torch.nn.functional.pad(x_, (pad, pad), mode="reflect")
+        # depthwise(채널별)로 동일 커널 적용
+        w = k.expand(C, 1, -1)
+        x_sm = torch.nn.functional.conv1d(x_pad, w, bias=None, stride=1, padding=0, groups=C)
+        x_sm = x_sm.reshape(*x.shape)
+
+        if t_ax != -1 and t_ax != x.ndim - 1:
+            inv = [0]*len(perm)
+            for i,p in enumerate(perm): inv[p]=i
+            x_sm = x_sm.permute(*inv)
+        return x_sm
+
+    def forward(self, *args, **kwargs):
+        if not self.training or self.mode == "none":
+            return self.base(*args, **kwargs)
+
+        # 첫 번째 텐서형 인수 찾아서 변환
+        args = list(args)
+        for i, a in enumerate(args):
+            if torch.is_tensor(a) and a.ndim >= 3:
+                x = a
+                if self.mode == "tod_shift":
+                    x = self._apply_tod_shift(x)
+                elif self.mode == "smooth":
+                    x = self._apply_smooth(x)
+                args[i] = x
+                break
+        return self.base(*args, **kwargs)
+
+
+# ---------------------------
+# 실험 본체
+# ---------------------------
 class W3Experiment(BaseExperiment):
     """
-    W3: 데이터 구조 원인 확인 (교란 시험)
-      - mode ∈ {'none','tod_shift','smooth'}
-      - per-run: 결과 원자료 저장(results_W3.csv, gate_* CSV들)
-      - 사후: forest Δ, perturb_delta_bar Δ 집계
+    W3 = 데이터 구조 원인 검증 (학습 교란 / 평가 클린)
+    mode ∈ {none, tod_shift, smooth}
     """
 
-    def __init__(self, cfg):
-        cfg_local = dict(cfg)
-        cfg_local["experiment_type"] = "W3"
+    def __init__(self, cfg: Dict[str, Any]):
+        cfg_local = copy.deepcopy(cfg or {})
+        cfg_local.setdefault("experiment_type", EXP_TAG)
+        if cfg_local.get("mode") not in PERTURB_MODES:
+            cfg_local["mode"] = "none"
+        # _W3PerturbWrapper가 사용하는 perturbation도 설정
+        if "perturbation" not in cfg_local:
+            cfg_local["perturbation"] = cfg_local.get("mode", "none")
         super().__init__(cfg_local)
-        # --- (선택) W3 모드에 따라 학습 로더만 교란 주입 ---
-        try:
-            mode = str(self.cfg.get("mode","none")).lower()
-            dtag = str(self.dataset_tag).lower()
-            if mode == "tod_shift" and "ettm2" in dtag:
-                self.train_loader.dataset = _TODShiftWrapper(self.train_loader.dataset, dataset_tag=dtag, max_shift=8)
-            elif mode == "smooth" and "etth2" in dtag:
-                self.train_loader.dataset = _SmoothWrapper(self.train_loader.dataset, dataset_tag=dtag, win=5)
-        except Exception:
-            pass
+        self._last_hooks_data: Dict[str, Any] = {}
+        self._last_direct: Dict[str, Any] = {}
 
-    # ------------------------------
-    # BaseExperiment 구현부
-    # ------------------------------
+        # 학습 시 forward 교란 패치(평가 시에는 꺼짐)
+        self.model = _W3PerturbWrapper(self.model, self.cfg)
+
+    # BaseExperiment 가 요구하는 모델 생성
     def _create_model(self):
-        """
-        - W3 모델: HybridTS(동적 교차). 교란은 데이터 레벨에서 처리.
-        - set_cross_directions(use_gc=True, use_cg=True) 시도(있으면).
-        """
-        model = HybridTS(self.cfg, self.n_vars)
-        if hasattr(model, "set_cross_directions"):
-            try:
-                model.set_cross_directions(use_gc=True, use_cg=True)
-            except Exception:
-                pass
-        return model
+        # W1/W2와 동일한 백본(수정 금지 원칙)
+        return HybridTS(self.cfg, self.n_vars)
 
-    # (선택) 교란 모드별 train_loader 래핑을 여기서 처리하고 싶다면
-    # BaseExperiment의 loader 생성 이후(self.train_loader) 교체하는 방식으로 구현할 수 있습니다.
-    # 단, W1/W2에 영향 주지 않기 위해 W3 내부에서만 건드리세요.
-    # 본 패치는 교란이 없어도 안전하게 작동하도록 설계(Δ≈0)되어 있습니다.
-
-    def evaluate_test(self):
-        """
-        W3는 게이트 기반 그림이 필요하므로 collect_gate_outputs=True로 direct_evidence를 수집한다.
-        또한 gate_log_s/m/d가 있으면 gates_by_stage에 흡수하여 plotting으로 넘긴다.
-        나머지는 BaseExperiment.evaluate_test 흐름을 따른다.
-        """
+    # ------------- 평가 1회 -------------
+    def evaluate_test(self) -> Dict[str, Any]:
+        # (평가는 깨끗한 데이터; 교란은 wrapper가 training시에만 적용)
         tod_vec = build_test_tod_vector(self.cfg)
+        direct = evaluate_with_direct_evidence(
+            self.model,
+            self.test_loader,
+            self.mu,
+            self.std,
+            tod_vec=tod_vec,
+            device=self.device,
+            collect_gate_outputs=True,
+        )
 
         hooks_data = {}
-        # ★ W3: 게이트도 수집한다
-        direct = evaluate_with_direct_evidence(
-            self.model, self.test_loader, self.mu, self.std,
-            tod_vec=tod_vec, device=self.device,
-            collect_gate_outputs=True
-        )
+        w3_hooks = direct.pop("hooks_data", None)
+        if w3_hooks:
+            hooks_data.update(w3_hooks or {})
 
-        # direct → hooks_data 병합
-        w2_hooks = direct.pop("hooks_data", None)
-        if w2_hooks:
-            hooks_data.update(w2_hooks or {})
-
-        # ★ W3: 스테이지 산발 키(gate_log_s/m/d) 흡수 → gates_by_stage 구성
-        gbs = {}
-        for k, st in [("gate_log_s","S"),("gate_log_m","M"),("gate_log_d","D")]:
-            if k in direct and direct[k] is not None:
-                gbs[st] = direct[k]
-        if gbs:
-            hooks_data.setdefault("gates_by_stage", {}).update(gbs)
-
-        # W3 특화 지표(필요 시): all_metrics로 위임
-        direct_evidence = direct.copy()
-        try:
-            from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
-            exp_specific = compute_all_experiment_metrics(
-                experiment_type="W3",
-                model=self.model,
-                hooks_data=hooks_data if hooks_data else None,
-                tod_vec=tod_vec,
-                direct_evidence=direct_evidence,
-                perturbation_type=self.cfg.get("mode","none"),  # 'none'|'tod_shift'|'smooth'
-            )
-            for k, v in exp_specific.items():
-                direct[k] = v
-        except ImportError:
-            pass
-
-        # 보고용 그림 지표 계산 (w3_plotting_metrics.compute_experiment_plotting_metrics 호출)
-        plotting_metrics = {}
-        small_loader = torch.utils.data.DataLoader(
-            self.test_loader.dataset,
-            batch_size=min(16, self.cfg.get("batch_size", 128)),
-            shuffle=False, num_workers=0
-        )
-        try:
-            from importlib import import_module
-            module = import_module("utils.experiment_plotting_metrics.w3_plotting_metrics")
-            compute_fn = getattr(module, "compute_experiment_plotting_metrics", None)
-            if callable(compute_fn):
-                plotting_metrics = compute_fn(
-                    model=self.model,
-                    loader=small_loader,
-                    mu=self.mu, std=self.std,
-                    tod_vec=tod_vec,
-                    device=self.device,
-                    hooks_data=hooks_data,
-                    cfg=self.cfg,
-                ) or {}
-        except ImportError:
-            plotting_metrics = {}
-
-        for k, v in (plotting_metrics or {}).items():
-            direct[k] = v
-
-        self._plotting_payload = plotting_metrics
-        self._last_hooks_data = copy.deepcopy(hooks_data)
-        self._last_direct = copy.deepcopy(direct)
+        self._last_hooks_data = copy.deepcopy(hooks_data) if hooks_data else {}
+        self._last_direct = copy.deepcopy(direct) if direct else {}
         return direct
 
-    # ------------------------------
-    # 내부: 게이트 패키징(시간대 평균/분포)
-    # ------------------------------
-    def _extract_gate_raw(
-        self, hooks: Dict[str, Any]
-    ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
-        """
-        반환:
-          gates_by_stage: dict('S'|'M'|'D' -> np.ndarray)
-          gates_all:      np.ndarray (전 채널/스테이지 평탄화 벡터; 분포 요약용)
-        """
-        # 1) stage dict 최우선
-        for key in ["gates_by_stage", "gate_by_stage", "gate_logs_by_stage"]:
-            if key in hooks and isinstance(hooks[key], dict):
-                gbs = {}
-                for s in ("S","M","D","s","m","d"):
-                    if s in hooks[key]:
-                        gbs[s.upper()] = np.asarray(hooks[key][s])
-                if gbs:
-                    ga = np.concatenate([np.ravel(v) for v in gbs.values() if v is not None], axis=0)
-                    return gbs, ga
-
-        # 2) gate_outputs 목록이 있으면 평균으로 근사
-        if "gate_outputs" in hooks and hooks["gate_outputs"]:
-            arrs = hooks["gate_outputs"]  # list of arrays
-            try:
-                cat = np.concatenate([np.asarray(a) for a in arrs], axis=0)  # (N, ...)
-            except Exception:
-                cat = np.asarray(arrs[0])
-            # 스테이지 구분 불가 시 전체를 'M'으로 뭉텅이 처리
-            gbs = {"M": np.asarray(cat, dtype=float)}
-            ga = np.ravel(cat.astype(float))
-            return gbs, ga
-
-        # 3) 아무것도 없으면 빈값
-        return {}, np.array([], dtype=float)
-
-    # ------------------------------
-    # 저장/그림 파이프 (per-run)
-    # ------------------------------
+    # ------------- 저장/그림 -------------
     def _after_eval_save(
         self,
-        dataset: str, horizon: int, seed: int, mode: str,
-        direct: Dict[str, Any], hooks: Dict[str, Any],
-        model_tag: str, run_tag: str
+        dataset: str,
+        horizon: int,
+        seed: int,
+        mode: str,
+        direct: Dict[str, Any],
+        hooks: Dict[str, Any],
+        model_tag: str,
+        run_tag: str,
     ) -> None:
-        """
-        per-run에서 다음을 저장:
-          - forest_plot_detail.csv (RMSE/MAE)
-          - gate_tod_heatmap_(summary|detail).csv
-          - gate_distribution_(summary|detail).csv
-          - results_W3.csv (원자료 + cg_*/gc_* + gate 요약 스칼라)
-        사후 집계:
-          - forest Δ (none vs perturbed)
-          - perturb_delta_bar Δ (TOD/PEAK 핵심지표 Δ)
-        """
         ctx = {
-            "experiment_type": EXP_TAG, "dataset": str(dataset), "horizon": int(horizon),
-            "seed": int(seed), "mode": str(mode), "model_tag": str(model_tag), "run_tag": str(run_tag)
+            "experiment_type": EXP_TAG,
+            "dataset": dataset,
+            "horizon": int(horizon),
+            "seed": int(seed),
+            "mode": str(mode),
+            "model_tag": str(model_tag),
+            "run_tag": str(run_tag),
         }
 
         # 1) forest raw(detail)
@@ -306,169 +283,80 @@ class W3Experiment(BaseExperiment):
         mae_real  = float(direct.get("mae") or direct.get("mae_real", np.nan))
         fdir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "forest_plot"
         fdir.mkdir(parents=True, exist_ok=True)
-        save_w3_forest_detail_row({**ctx, "plot_type": "forest_plot"},
-                                  rmse_real=rmse_real, mae_real=mae_real,
-                                  detail_csv=fdir / "forest_plot_detail.csv")
-
-        # 2) gate raw → Heatmap/Distribution
-        gbs, gall = self._extract_gate_raw(hooks)
-        tod_bins = infer_tod_bins_by_dataset(dataset)
-        max_T = max(
-            len(gbs.get("S", [])) if isinstance(gbs.get("S", []), (list, np.ndarray)) else 0,
-            len(gbs.get("M", [])) if isinstance(gbs.get("M", []), (list, np.ndarray)) else 0,
-            len(gbs.get("D", [])) if isinstance(gbs.get("D", []), (list, np.ndarray)) else 0,
-            tod_bins,
-        )
-        if max_T <= 0: max_T = tod_bins
-        tod_labels = list(range(max_T))
-
-        # Heatmap (S/M/D 시간대 평균)
-        tdir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_tod_heatmap"
-        tdir.mkdir(parents=True, exist_ok=True)
-        compute_and_save_w3_gate_tod_heatmap(
-            ctx={**ctx, "plot_type": "gate_tod_heatmap"},
-            gates_by_stage=gbs, tod_labels=tod_labels,
-            out_dir=tdir, amp_method="range"
+        save_w3_forest_detail_row(
+            {**ctx, "plot_type": "forest_plot"},
+            rmse_real=rmse_real, mae_real=mae_real,
+            detail_csv=fdir / "forest_plot_detail.csv",
         )
 
-        # Distribution (전역 분포/분위수/채널통계)
+        # 2) gate heatmap / distribution (hooks + tod_vec 기반)
+        tod_vec = build_test_tod_vector(self.cfg)
+        hdir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_tod_heatmap"
+        hdir.mkdir(parents=True, exist_ok=True)
+        compute_and_save_w3_gate_tod_heatmap({**ctx, "plot_type": "gate_tod_heatmap"},
+                                             hooks_data=hooks, tod_vec=tod_vec, dataset=dataset, out_dir=hdir)
+
         ddir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_distribution"
         ddir.mkdir(parents=True, exist_ok=True)
-        compute_and_save_w3_gate_distribution(
-            ctx={**ctx, "plot_type": "gate_distribution"},
-            gates_by_stage=gbs, gates_all=gall,
-            out_dir=ddir
-        )
+        compute_and_save_w3_gate_distribution({**ctx, "plot_type": "gate_distribution"},
+                                              hooks_data=hooks, out_dir=ddir)
 
-        # gate 요약 스칼라(결과 CSV용; Heatmap/Distribution 단계에서 계산된 summary와 일치)
-        # 간단히 detail/summary 파일을 읽지 않고도 scalar를 재계산 가능하도록 최소 통계만 취합
-        gate_mean = float(np.nanmean(gall)) if gall.size > 0 and np.isfinite(gall).any() else np.nan
-        gate_std  = float(np.nanstd(gall))  if gall.size > 0 and np.isfinite(gall).any() else np.nan
-        gate_entropy = np.nan
-        if gall.size > 0:
-            pos = gall[np.isfinite(gall) & (gall > 1e-8)]
-            if pos.size > 0:
-                p = pos / (pos.sum() + 1e-12)
-                gate_entropy = float(-np.sum(p * np.log(p + 1e-12)))
-
-        # TOD 평균(스테이지별 평균의 평균) 및 민감도(range 평균)
-        def _stage_mean(stage: str) -> float:
-            if stage in gbs and isinstance(gbs[stage], np.ndarray) and gbs[stage].size > 0:
-                a = np.asarray(gbs[stage], float)
-                # 시간축만 남기고 평균(다른 축은 평균)
-                if a.ndim > 1:
-                    axes = tuple(i for i in range(a.ndim - 1))
-                    a = np.nanmean(a, axis=axes)
-                return float(np.nanmean(a))
-            return np.nan
-
-        gate_tod_mean_s = _stage_mean("S")
-        gate_tod_mean_m = _stage_mean("M")
-        gate_tod_mean_d = _stage_mean("D")
-
-        def _amp(x: np.ndarray) -> float:
-            if x.size == 0 or not np.isfinite(x).any(): return np.nan
-            return float(np.nanmax(x) - np.nanmin(x))
-
-        amps = []
-        for st in ("S","M","D"):
-            if st in gbs and isinstance(gbs[st], np.ndarray) and gbs[st].size > 0:
-                a = np.asarray(gbs[st], float)
-                # 시간축만 남기고 평균
-                if a.ndim > 1:
-                    axes = tuple(i for i in range(a.ndim - 1))
-                    a = np.nanmean(a, axis=axes)
-                amps.append(_amp(a))
-        tod_amp_mean = float(np.nanmean([v for v in amps if np.isfinite(v)])) if amps else np.nan
-
-        # 분위수/상위 히스토그램
-        gate_q10 = gate_q50 = gate_q90 = gate_hist10 = np.nan
-        if gall.size > 0 and np.isfinite(gall).any():
-            fin = gall[np.isfinite(gall)]
-            if fin.size >= 5:
-                gate_q10, gate_q50, gate_q90 = np.quantile(fin, [0.10, 0.50, 0.90]).tolist()
-                gate_hist10 = float((fin > gate_q90).mean())
-
-        # 3) results_W3.csv (per-run 원자료 1행)
+        # 3) results_W3.csv 1행 추가(직접근거 + 게이트 요약 일부 동시 저장)
         row = {
             "dataset": dataset, "horizon": horizon, "seed": seed, "mode": mode,
             "model_tag": model_tag, "experiment_type": EXP_TAG,
             "mse_real": float(direct.get("mse_real", np.nan)),
-            "rmse": rmse_real, "mae": mae_real,
-
-            # 게이트 전역 요약
-            "gate_mean": gate_mean, "gate_std": gate_std, "gate_entropy": gate_entropy,
-            "gate_q10": gate_q10, "gate_q50": gate_q50, "gate_q90": gate_q90, "gate_hist10": gate_hist10,
-
-            # TOD 요약
-            "gate_tod_mean_s": gate_tod_mean_s,
-            "gate_tod_mean_m": gate_tod_mean_m,
-            "gate_tod_mean_d": gate_tod_mean_d,
-            "tod_amp_mean": tod_amp_mean,
+            "rmse": float(rmse_real), "mae": float(mae_real),
+            # direct evidence 주요 지표 (있으면 저장)
+            "cg_pearson_mean": direct.get("cg_pearson_mean", np.nan),
+            "cg_spearman_mean": direct.get("cg_spearman_mean", np.nan),
+            "cg_dcor_mean": direct.get("cg_dcor_mean", np.nan),
+            "cg_event_gain": direct.get("cg_event_gain", np.nan),
+            "cg_event_hit": direct.get("cg_event_hit", np.nan),
+            "cg_maxcorr": direct.get("cg_maxcorr", np.nan),
+            "cg_bestlag": direct.get("cg_bestlag", np.nan),
+            "gc_kernel_tod_dcor": direct.get("gc_kernel_tod_dcor", np.nan),
+            "gc_feat_tod_dcor": direct.get("gc_feat_tod_dcor", np.nan),
+            "gc_feat_tod_r2": direct.get("gc_feat_tod_r2", np.nan),
+            "gc_kernel_feat_dcor": direct.get("gc_kernel_feat_dcor", np.nan),
+            "gc_kernel_feat_align": direct.get("gc_kernel_feat_align", np.nan),
         }
-        row = _merge_cg_gc(row, direct)  # cg_*/gc_* 병합
+        _append_or_update_results(RESULTS_ROOT / f"results_{EXP_TAG}.csv",
+                                  row, subset=["dataset","horizon","seed","mode","model_tag","experiment_type"])
 
-        csv_path = RESULTS_ROOT / f"results_{EXP_TAG}.csv"
-        self._append_or_update_results(csv_path, row,
-            subset=["dataset","horizon","seed","mode","model_tag","experiment_type"])
-
-        # 4) 사후 집계(Δ): baseline('none') ↔ perturbed('tod_shift'/'smooth') 매칭
-        #    - 누적적으로 안전(idempotent)
+        # 4) 집계: forest Δ / perturb delta‑bar (idempotent)
         rebuild_w3_forest_summary(
             detail_csv=fdir / "forest_plot_detail.csv",
             summary_csv=fdir / "forest_plot_summary.csv",
-            gate_tod_summary_csv=tdir / "gate_tod_heatmap_summary.csv",
-            gate_dist_summary_csv=ddir / "gate_distribution_summary.csv",
-            baseline_mode="none",
-            perturbed_modes=("tod_shift","smooth"),
+            gate_tod_summary_csv=hdir / "gate_tod_heatmap_summary.csv",
             group_keys=("experiment_type","dataset","horizon")
         )
-        # 원인 지표 Δ bar (TOD/PEAK)
         rebuild_w3_perturb_delta_bar(
             results_csv=RESULTS_ROOT / f"results_{EXP_TAG}.csv",
-            out_dir=RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "perturb_delta_bar",
-            baseline_mode="none"
+            detail_csv=RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "perturb_delta_bar" / "perturb_delta_bar_detail.csv",
+            summary_csv=RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "perturb_delta_bar" / "perturb_delta_bar_summary.csv",
         )
 
-    def _append_or_update_results(self, csv_path: Path, row: Dict[str, Any], subset: List[str]) -> None:
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        df_new = pd.DataFrame([row])
-        if csv_path.exists():
-            df_old = pd.read_csv(csv_path)
-            for c in df_new.columns:
-                if c not in df_old.columns:
-                    df_old[c] = np.nan
-            for c in df_old.columns:
-                if c not in df_new.columns:
-                    df_new[c] = np.nan
-            df = pd.concat([df_old, df_new], ignore_index=True)
-            df.drop_duplicates(subset=subset, keep="last", inplace=True)
-            tmp = csv_path.with_suffix(".csv.tmp")
-            df.to_csv(tmp, index=False)
-            tmp.replace(csv_path)
-        else:
-            df_new.to_csv(csv_path, index=False)
+    # ------------- 실행 진입점 -------------
+    def run(self):
+        """
+        main.py와 run_suite.py에서 호출됨.
+        """
+        # dataset은 cfg["dataset"] 또는 self.dataset_tag 사용
+        dataset = str(self.cfg.get("dataset") or self.dataset_tag)
+        horizon = int(self.cfg.get("horizon", 96))
+        seed    = int(self.cfg.get("seed", 42))
+        mode    = str(self.cfg.get("mode", "none"))
+        model_tag = getattr(self.model.base, "model_tag", "HyperConv")
+        run_tag   = f"{EXP_TAG}_{dataset}_{horizon}_{seed}_{mode}"
 
-    # ------------------------------
-    # 메인 엔트리
-    # ------------------------------
-    def run(self) -> bool:
         try:
-            self.train()
+            # 표준 학습 → 검증 → 테스트 (학습 단계에서만 wrapper가 교란 적용)
+            self.train()          # BaseExperiment 제공
             direct = self.evaluate_test()
-            hooks = copy.deepcopy(getattr(self, "_last_hooks_data", {}))
+            hooks = self._last_hooks_data
 
-            dataset = str(getattr(self, "dataset_tag", self.cfg.get("dataset", "UNKNOWN")))
-            horizon = int(self.cfg.get("horizon", self.cfg.get("pred_len", 96)))
-            seed = int(self.cfg.get("seed", 42))
-            mode = str(self.cfg.get("mode", "none"))
-            model_tag = str(self.cfg.get("model_tag", getattr(self.model, "model_tag", "HyperConv")))
-            run_tag = f"{EXP_TAG}_{dataset}_{horizon}_{seed}_{mode}"
-
-            self._after_eval_save(
-                dataset=dataset, horizon=horizon, seed=seed, mode=mode,
-                direct=direct, hooks=hooks, model_tag=model_tag, run_tag=run_tag
-            )
-            return True
-        except Exception:
-            return False
+            self._after_eval_save(dataset, horizon, seed, mode, direct, hooks, model_tag, run_tag)
+        finally:
+            # 반드시 남은 .pt/메모리 정리
+            self.cleanup()

@@ -1,413 +1,391 @@
 # ============================================================
 # utils/experiment_plotting_metrics/w3_plotting_metrics.py
-#   - W3 전용: Gate-TOD Heatmap / Gate Distribution / Forest Δ / Perturb Δ Bar
-#   - summary + detail (append+dedupe, atomic write)
+#   - W3: Gate‑TOD Heatmap / Gate Distribution / Forest / Perturb Δ
+#   - summary + detail, append+dedupe, atomic write, pandas warning fix
 # ============================================================
 
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
-import math
 import numpy as np
 import pandas as pd
 
 _W3_KEYS = ["experiment_type","dataset","plot_type","horizon","seed","mode","model_tag","run_tag"]
 
 def _ensure_dir(p: str | Path) -> Path:
-    p = Path(p)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
+    p = Path(p); p.parent.mkdir(parents=True, exist_ok=True); return p
 
-def _atomic_write_csv(df: pd.DataFrame, path: str | Path) -> None:
-    path = _ensure_dir(path)
+def _atomic_write(df: pd.DataFrame, path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_csv(tmp, index=False)
-    tmp.replace(path)
-
-def _append_or_update_row(csv_path: str | Path, row: Dict[str,Any], subset_keys: List[str]) -> None:
-    path = _ensure_dir(csv_path)
-    new = pd.DataFrame([row])
-    if path.exists():
-        old = pd.read_csv(path)
-        if len(old) > 0 and all(k in old.columns for k in subset_keys):
-            mask = np.ones(len(old), dtype=bool)
-            for k in subset_keys:
-                mask &= (old[k] == row[k])
-            old = pd.concat([old[~mask], new], ignore_index=True)
-        else:
-            old = pd.concat([old, new], ignore_index=True)
-        _atomic_write_csv(old, path)
-    else:
-        _atomic_write_csv(new, path)
+    df.to_csv(tmp, index=False); tmp.replace(path)
 
 def _append_or_update_rows(csv_path: str | Path, rows: List[Dict[str,Any]], subset_keys: List[str]) -> None:
-    if not rows:
-        return
+    if not rows: return
     path = _ensure_dir(csv_path)
     new = pd.DataFrame(rows)
     if path.exists():
         old = pd.read_csv(path)
-        # 컬럼 union
+        # union
         for c in new.columns:
             if c not in old.columns: old[c] = np.nan
         for c in old.columns:
             if c not in new.columns: new[c] = np.nan
         df = pd.concat([old, new], ignore_index=True)
         df.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
-        _atomic_write_csv(df, path)
+        _atomic_write(df, path)
     else:
         new.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
-        _atomic_write_csv(new, path)
+        _atomic_write(new, path)
 
-def _to_f32(v: Any, ndigits: int = 6) -> float:
-    try:
-        f = float(v)
-        if not np.isfinite(f): return np.nan
-        return float(np.round(np.float32(f), ndigits))
-    except Exception:
-        return np.nan
+def _append_or_update_row(csv_path: str | Path, row: Dict[str,Any], subset_keys: List[str]) -> None:
+    _append_or_update_rows(csv_path, [row], subset_keys)
 
-def _zscore(x: pd.Series) -> pd.Series:
-    s = x.astype(float)
-    m = s.mean(); sd = s.std(ddof=0)
-    if not np.isfinite(sd) or sd == 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - m) / sd
+def _infer_tod_bins(dataset: str) -> int:
+    ds = (dataset or "").lower()
+    if "ettm" in ds: return 96
+    if "etth" in ds: return 24
+    if "weather" in ds: return 144
+    return 24
+
+def _tod_index_from_vec(tod_vec: np.ndarray, T: int) -> np.ndarray:
+    """
+    tod_vec: shape (N,2) with [sin, cos]
+    return: (N,) integer bin in [0, T-1]
+    """
+    if not isinstance(tod_vec, np.ndarray) or tod_vec.ndim != 2 or tod_vec.shape[1] < 2:
+        return np.array([], dtype=int)
+    s = np.asarray(tod_vec[:, 0], float)
+    c = np.asarray(tod_vec[:, 1], float)
+    ang = np.arctan2(s, c)  # [-pi, pi]
+    ang = (ang + 2*np.pi) % (2*np.pi)
+    idx = np.floor(ang / (2*np.pi) * T).astype(int)
+    idx = np.clip(idx, 0, T-1)
+    return idx
+
+def _stage_split_mean_per_sample(gates: np.ndarray) -> Dict[str, np.ndarray]:
+    """
+    gates: (N, L, G) or (Batches ... concat) → 샘플축 N, 레이어축 L, gate축 G
+    반환: {'S': (N,), 'M': (N,), 'D': (N,)}
+    """
+    if gates is None or not isinstance(gates, np.ndarray) or gates.ndim < 2:
+        return {}
+    arr = np.asarray(gates, float)
+    if arr.ndim == 2:  # (N, G)
+        arr = arr.reshape(arr.shape[0], 1, arr.shape[1])
+    N, L, G = arr.shape[0], arr.shape[1], arr.shape[2]
+    if L <= 0:
+        return {}
+    # 레이어를 3분할
+    b1 = max(1, L // 3)
+    b2 = max(b1+1, (2*L)//3)
+    ss = arr[:, :b1, :].mean(axis=(1, 2))
+    mm = arr[:, b1:b2, :].mean(axis=(1, 2))
+    dd = arr[:, b2:,  :].mean(axis=(1, 2)) if b2 < L else arr[:, -1:, :].mean(axis=(1, 2))
+    return {"S": ss, "M": mm, "D": dd}
+
+def _collect_gate_arrays_from_hooks(hooks_data: Dict[str,Any]) -> Optional[np.ndarray]:
+    """
+    hooks_data에서 gate_outputs(list of arrays) 우선 수집 → (N,L,G)로 연결
+    없으면 None
+    """
+    if not isinstance(hooks_data, dict): return None
+    src = None
+    if "gate_outputs" in hooks_data and hooks_data["gate_outputs"]:
+        # list of (B,L,G) or (B,*,G)
+        bags = []
+        for a in hooks_data["gate_outputs"]:
+            try:
+                a = np.asarray(a, float)
+                if a.ndim >= 2:
+                    if a.ndim == 2:  # (B,G)
+                        a = a.reshape(a.shape[0], 1, a.shape[1])
+                    elif a.ndim > 3:
+                        # (B,*,G) -> (B,L,G)
+                        L = int(np.prod(a.shape[1:-1]))
+                        a = a.reshape(a.shape[0], L, a.shape[-1])
+                    bags.append(a)
+            except Exception:
+                continue
+        if len(bags) > 0:
+            try:
+                src = np.concatenate(bags, axis=0)  # (N,L,G)
+            except Exception:
+                src = bags[0]
+    # stage dict가 별도로 있으면 병합(안전 평균)
+    for key in ("gates_by_stage","gate_by_stage","gate_logs_by_stage"):
+        if isinstance(hooks_data.get(key), dict) and hooks_data[key]:
+            # S/M/D를 평균해 (N,L=1,G)처럼 간주하여 src와 합쳐 평균
+            # 단, TOD 집계는 per‑sample 강도만 쓰므로 src가 없어도 stage 스플릿로 대체 가능
+            pass
+    return src
 
 
 # ============================================================
-# 1) Gate‑TOD Heatmap (summary + detail)
+# 1) Gate‑TOD heatmap
+#    - 샘플별 gate 강도 ↔ 해당 샘플 TOD bin 으로 집계 (T=dataset별)
 # ============================================================
 def compute_and_save_w3_gate_tod_heatmap(
     ctx: Dict[str,Any],                    # plot_type='gate_tod_heatmap'
-    gates_by_stage: Dict[str,np.ndarray],  # {'S':arr, 'M':arr, 'D':arr}
-    tod_labels: List[int],
+    hooks_data: Dict[str,Any],
+    tod_vec: np.ndarray,
+    dataset: str,
     out_dir: str | Path,
-    amp_method: str = "range",             # 'range' | 'std'
+    amp_method: str = "range",
 ) -> None:
     assert ctx.get("plot_type") == "gate_tod_heatmap"
-
-    def _reduce_time_axis_auto(a: np.ndarray, dataset: str) -> np.ndarray:
-        """
-        dataset별 기대 bin 우선:
-          - ETTm*: 96, ETTh*: 24, weather: 144
-          - 없으면 크기≥12 중 가장 큰 축
-        선택한 시간축 외 축은 평균 → 1D(T)
-        """
-        a = np.asarray(a, float)
-        if a.ndim == 1:
-            return a
-        ds = (dataset or "").lower()
-        if   "ettm" in ds: expected = {96}
-        elif "etth" in ds: expected = {24}
-        elif "weather" in ds: expected = {144}
-        else: expected = {24, 96, 144}
-        cand = [i for i, sz in enumerate(a.shape) if sz in expected]
-        if not cand:
-            cand = [i for i, sz in enumerate(a.shape) if sz >= 12]
-        t_axis = cand[0] if cand else (a.ndim - 1)
-        axes = tuple(i for i in range(a.ndim) if i != t_axis)
-        return np.nanmean(a, axis=axes)
-
-    dataset = str(ctx.get("dataset",""))
-    S = gates_by_stage.get("S", None)
-    M = gates_by_stage.get("M", None)
-    D = gates_by_stage.get("D", None)
-
-    s = _reduce_time_axis_auto(S, dataset) if S is not None else np.array([], float)
-    m = _reduce_time_axis_auto(M, dataset) if M is not None else np.array([], float)
-    d = _reduce_time_axis_auto(D, dataset) if D is not None else np.array([], float)
-
-    T = max(len(s), len(m), len(d))
-    if T <= 0:
-        summary_row = {
-            **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-            "tod_bins": 0,
-            "tod_amp_s": np.nan, "tod_amp_m": np.nan, "tod_amp_d": np.nan,
-            "tod_amp_mean": np.nan,
-            "valid_ratio": np.nan, "nan_count": 0, "amp_method": amp_method
-        }
-        _append_or_update_row(Path(out_dir)/"gate_tod_heatmap_summary.csv",
-                              summary_row, subset_keys=_W3_KEYS)
+    T = _infer_tod_bins(dataset)
+    idx = _tod_index_from_vec(tod_vec, T)
+    if idx.size == 0:
         return
 
-    if len(tod_labels) != T:
-        tod_labels = list(range(T))
+    gates = _collect_gate_arrays_from_hooks(hooks_data)
+    if gates is None:
+        return
 
-    def _amp(x: np.ndarray) -> float:
-        if x.size == 0 or not np.isfinite(x).any():
-            return np.nan
-        return _to_f32(np.nanstd(x) if amp_method=="std" else (np.nanmax(x)-np.nanmin(x)))
+    # 샘플별 stage 강도
+    st = _stage_split_mean_per_sample(gates)  # {'S':(N,), 'M':(N,), 'D':(N,)}
+    rows: List[Dict[str,Any]] = []
+    amp: Dict[str, float] = {"S": np.nan, "M": np.nan, "D": np.nan}
 
-    amp_s, amp_m, amp_d = _amp(s), _amp(m), _amp(d)
-    amp_mean = _to_f32(np.nanmean([v for v in [amp_s,amp_m,amp_d] if np.isfinite(v)]))
+    def _amp_fn(x: np.ndarray) -> float:
+        x = np.asarray(x, float)
+        x = x[np.isfinite(x)]
+        if x.size == 0: return np.nan
+        return float(np.nanstd(x) if amp_method=="std" else (np.nanmax(x)-np.nanmin(x)))
 
-    all_vals = np.concatenate([v for v in [s,m,d] if v.size>0], axis=0)
-    valid_ratio = _to_f32(np.isfinite(all_vals).mean()) if all_vals.size>0 else np.nan
-    nan_count   = int(all_vals.size - int(np.isfinite(all_vals).sum()))
+    for stage in ("S","M","D"):
+        if stage not in st: continue
+        v = np.asarray(st[stage], float)            # (N,)
+        bins = [[] for _ in range(T)]
+        msk = np.isfinite(v)
+        for i, ok in enumerate(msk):
+            if not ok: continue
+            j = int(idx[i])
+            bins[j].append(float(v[i]))
+        means = [float(np.nan if len(b)==0 else np.mean(b)) for b in bins]
+        # detail
+        for t, mv in enumerate(means):
+            if np.isfinite(mv):
+                rows.append({
+                    **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+                    "tod": int(t), "stage": stage, "gate_mean": float(mv)
+                })
+        # amp
+        amp[stage] = _amp_fn(np.array([x for x in means if np.isfinite(x)], float))
 
     # summary
     summary_row = {
         **{k: ctx[k] for k in _W3_KEYS if k in ctx},
         "tod_bins": int(T),
-        "tod_amp_s": amp_s, "tod_amp_m": amp_m, "tod_amp_d": amp_d,
-        "tod_amp_mean": amp_mean,
-        "valid_ratio": valid_ratio, "nan_count": nan_count,
+        "tod_amp_s": amp.get("S", np.nan),
+        "tod_amp_m": amp.get("M", np.nan),
+        "tod_amp_d": amp.get("D", np.nan),
+        "tod_amp_mean": float(np.nanmean([v for v in amp.values() if np.isfinite(v)])) if any(np.isfinite(list(amp.values()))) else np.nan,
+        "valid_ratio": 1.0, "nan_count": 0,
         "amp_method": amp_method
     }
     _append_or_update_row(Path(out_dir)/"gate_tod_heatmap_summary.csv",
                           summary_row, subset_keys=_W3_KEYS)
-
-    # detail
-    rows: List[Dict[str,Any]] = []
-    for stage, arr in (("S",s),("M",m),("D",d)):
-        for t, v in enumerate(arr):
-            if not np.isfinite(v): continue
-            rows.append({
-                **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-                "tod": int(tod_labels[t]), "stage": stage, "gate_mean": _to_f32(v)
-            })
     _append_or_update_rows(Path(out_dir)/"gate_tod_heatmap_detail.csv",
                            rows, subset_keys=_W3_KEYS+["tod","stage"])
 
+
 # ============================================================
-# 2) Gate Distribution (summary + detail)
+# 2) Gate distribution (게이트 전역 분포 요약 + 분위수 long)
 # ============================================================
 def compute_and_save_w3_gate_distribution(
     ctx: Dict[str,Any],                    # plot_type='gate_distribution'
-    gates_by_stage: Dict[str,np.ndarray],
-    gates_all: np.ndarray,
+    hooks_data: Dict[str,Any],
     out_dir: str | Path,
-    quantile_keys: Optional[List[str]] = None
 ) -> None:
     assert ctx.get("plot_type") == "gate_distribution"
-    g = np.asarray(gates_all, float) if isinstance(gates_all, np.ndarray) else np.array([], float)
+    gates = _collect_gate_arrays_from_hooks(hooks_data)
+    if gates is None: return
+    a = np.asarray(gates, float).reshape(-1)
+    fin = a[np.isfinite(a)]
+    if fin.size == 0: return
 
-    g_mean = _to_f32(np.nanmean(g)) if g.size>0 and np.isfinite(g).any() else np.nan
-    g_std  = _to_f32(np.nanstd(g))  if g.size>0 and np.isfinite(g).any() else np.nan
-    g_ent  = np.nan
-    if g.size>0:
-        pos = g[np.isfinite(g) & (g > 1e-8)]
-        if pos.size>0:
-            p = pos / (pos.sum() + 1e-12)
-            g_ent = _to_f32(-np.sum(p*np.log(p + 1e-12)))
-    valid_ratio = _to_f32(np.isfinite(g).mean()) if g.size>0 else np.nan
-    nan_count   = int(g.size - int(np.isfinite(g).sum()))
+    def _entropy_pos(x: np.ndarray) -> float:
+        x = x[x > 1e-8]
+        if x.size == 0: return np.nan
+        p = x / (x.sum() + 1e-12)
+        return float(-np.sum(p*np.log(p + 1e-12)))
 
-    summary_row = {
+    row = {
         **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-        "gate_mean": g_mean, "gate_std": g_std, "gate_entropy": g_ent,
-        "valid_ratio": valid_ratio, "nan_count": nan_count
+        "gate_mean": float(np.mean(fin)),
+        "gate_std":  float(np.std(fin, ddof=0)),
+        "gate_entropy": _entropy_pos(fin),
+        "valid_ratio": 1.0, "nan_count": 0
     }
-    _append_or_update_row(Path(out_dir)/"gate_distribution_summary.csv", summary_row, subset_keys=_W3_KEYS)
+    _append_or_update_row(Path(out_dir)/"gate_distribution_summary.csv", row, subset_keys=_W3_KEYS)
 
-    if quantile_keys is None:
-        quantile_keys = ["gate_q05","gate_q10","gate_q25","gate_q50","gate_q75","gate_q90","gate_q95"]
-    qvals = {}
-    if g.size>0 and np.isfinite(g).any():
-        qs = [0.05,0.10,0.25,0.50,0.75,0.90,0.95]
-        vals = np.quantile(g[np.isfinite(g)], qs).tolist()
-        qvals = dict(zip(quantile_keys, [ _to_f32(v) for v in vals ]))
-    q_rows: List[Dict[str,Any]] = []
-    for k,v in qvals.items():
-        q_rows.append({ **{k2: ctx[k2] for k2 in _W3_KEYS if k2 in ctx}, "stat": k, "value": v })
-    if q_rows:
-        _append_or_update_rows(Path(out_dir)/"gate_distribution_quantiles_detail.csv",
-                               q_rows, subset_keys=_W3_KEYS+["stat"])
+    qs = [0.05,0.10,0.25,0.50,0.75,0.90,0.95]
+    qv = np.quantile(fin, qs)
+    q_rows = []
+    for p, v in zip(qs, qv):
+        q_rows.append({
+            **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+            "stat": f"gate_q{int(p*100):02d}",
+            "value": float(v)
+        })
+    _append_or_update_rows(Path(out_dir)/"gate_distribution_quantiles_detail.csv",
+                           q_rows, subset_keys=_W3_KEYS+["stat"])
 
 
 # ============================================================
-# 3) Forest Δ (none vs perturbed)
+# 3) Forest: raw(detail) → summary(Δ)
 # ============================================================
 def save_w3_forest_detail_row(
-    ctx: Dict[str,Any], rmse_real: float, mae_real: float, detail_csv: str | Path
+    ctx: Dict[str,Any],                    # plot_type='forest_plot'
+    rmse_real: float, mae_real: float,
+    detail_csv: str | Path,
 ) -> None:
-    row = { **{k:ctx[k] for k in _W3_KEYS if k in ctx},
-            "rmse_real": _to_f32(rmse_real), "mae_real": _to_f32(mae_real) }
+    assert ctx.get("plot_type") == "forest_plot"
+    row = {**{k: ctx[k] for k in _W3_KEYS if k in ctx}, "rmse_real": float(rmse_real), "mae_real": float(mae_real)}
     _append_or_update_row(detail_csv, row, subset_keys=_W3_KEYS)
 
 def rebuild_w3_forest_summary(
     detail_csv: str | Path,
     summary_csv: str | Path,
     gate_tod_summary_csv: Optional[str | Path] = None,
-    gate_dist_summary_csv: Optional[str | Path] = None,
-    baseline_mode: str = "none",
-    perturbed_modes: Tuple[str,...] = ("tod_shift","smooth"),
-    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon")
-) -> pd.DataFrame:
-    detail_csv = Path(detail_csv)
-    if not detail_csv.exists():
-        out = pd.DataFrame(columns=list(group_keys)+["perturbation","n_pairs",
-                            "delta_rmse_mean","delta_rmse_pct_mean","delta_mae_mean",
-                            "delta_tod_mean","delta_var_time_mean"])
-        _atomic_write_csv(out, summary_csv)
-        return out
+    group_keys: Tuple[str, ...] = ("experiment_type","dataset","horizon"),
+) -> None:
+    import pandas as pd, numpy as np
+    dpath = Path(detail_csv)
+    if not dpath.exists(): return
+    df = pd.read_csv(dpath)
+    if df.empty: return
 
-    df = pd.read_csv(detail_csv)
-    need = set(group_keys) | {"seed","mode","rmse_real","mae_real"}
-    miss = [c for c in need if c not in df.columns]
-    if miss:
-        raise ValueError(f"Missing columns in forest detail csv: {miss}")
+    # none(베이스) ↔ {tod_shift, smooth} 매칭
+    base = df[df["mode"]=="none"]
+    pert = df[df["mode"]!="none"]
 
-    rows: List[pd.DataFrame] = []
-    on = list(group_keys)+["seed"]
+    # RMSE/MAE Δ
+    merged = pert.merge(base,
+                        on=list(group_keys)+["seed","model_tag"],
+                        suffixes=("_p","_b"),
+                        how="left")
+    if merged.empty: return
 
-    # 보조 요약 join 준비
-    tdf = pd.read_csv(gate_tod_summary_csv) if (gate_tod_summary_csv and Path(gate_tod_summary_csv).exists()) else None
-    vdf = pd.read_csv(gate_dist_summary_csv) if (gate_dist_summary_csv and Path(gate_dist_summary_csv).exists()) else None
+    out_rows = []
+    for keys, g in merged.groupby(list(group_keys), as_index=False):
+        for perturbation in ["tod_shift","smooth"]:
+            gi = g[g["mode_p"]==perturbation]
+            if gi.empty: 
+                continue
+            delta_rmse = (gi["rmse_real_p"] - gi["rmse_real_b"]).astype(float)
+            delta_mae  = (gi["mae_real_p"]  - gi["mae_real_b"]).astype(float)
+            row = {k: gi[k].iloc[0] for k in group_keys}
+            row.update({
+                "perturbation": perturbation,
+                "n_pairs": int(len(gi)),
+                "delta_rmse_mean": float(delta_rmse.mean()),
+                "delta_rmse_pct_mean": float((delta_rmse / gi["rmse_real_b"].astype(float)).mean() * 100.0) if len(gi)>0 else np.nan,
+                "delta_mae_mean": float(delta_mae.mean()),
+                "delta_tod_mean": np.nan   # 아래 delta‑bar엔 TOD 민감도 상세가 있음
+            })
+            out_rows.append(row)
 
-    for pert in perturbed_modes:
-        per = df[df["mode"]==pert].copy()
-        base= df[df["mode"]==baseline_mode].copy()
-        if len(per)==0 or len(base)==0:
-            continue
-        base = per.merge(base, on=on, suffixes=("_per","_base"))
-
-        # TOD join
-        if isinstance(tdf, pd.DataFrame):
-            need_t = set(group_keys) | {"seed","mode","tod_amp_mean"}
-            if need_t.issubset(set(tdf.columns)):
-                t_per  = tdf[tdf["mode"]==pert][list(group_keys)+["seed","tod_amp_mean"]].rename(columns={"tod_amp_mean":"tod_amp_mean_per"})
-                t_base = tdf[tdf["mode"]==baseline_mode][list(group_keys)+["seed","tod_amp_mean"]].rename(columns={"tod_amp_mean":"tod_amp_mean_base"})
-                base = base.merge(t_per,on=on,how="left").merge(t_base,on=on,how="left")
-
-        # VarT join
-        if isinstance(vdf, pd.DataFrame):
-            # W3 distribution summary에는 gate_var_time 명시가 없으므로 생략/혹은 gate_std를 대체지표로 사용 가능
-            pass
-
-        base["delta_rmse"] = (base["rmse_real_per"] - base["rmse_real_base"]).astype(np.float32)  # 교란으로 악화(+) 기대
-        base["delta_rmse_pct"] = (base["delta_rmse"] / base["rmse_real_base"]).astype(np.float32) * 100.0
-        base["delta_mae"]  = (base["mae_real_per"]  - base["mae_real_base"]).astype(np.float32)
-
-        if "tod_amp_mean_per" in base.columns and "tod_amp_mean_base" in base.columns:
-            base["delta_tod"] = (base["tod_amp_mean_per"] - base["tod_amp_mean_base"]).astype(np.float32)
-        else:
-            base["delta_tod"] = np.nan
-
-        base["perturbation"] = pert
-        rows.append(base)
-
-    if not rows:
-        out = pd.DataFrame(columns=list(group_keys)+["perturbation","n_pairs",
-                            "delta_rmse_mean","delta_rmse_pct_mean","delta_mae_mean",
-                            "delta_tod_mean"])
-        _atomic_write_csv(out, summary_csv)
-        return out
-
-    base = pd.concat(rows, ignore_index=True)
-
-    def _ci_mean(a: np.ndarray) -> Tuple[float,float,float]:
-        a = a[np.isfinite(a)]
-        if a.size==0: return (np.nan,np.nan,np.nan)
-        m = float(np.mean(a))
-        s = float(np.std(a, ddof=1)) if a.size>1 else 0.0
-        se= s / math.sqrt(max(1,a.size))
-        return (_to_f32(m), _to_f32(m-1.96*se), _to_f32(m+1.96*se))
-
-    # groupby FutureWarning 회피: group_keys=False 명시
-    agg = (base
-        .groupby(list(group_keys)+["perturbation"], as_index=False)
-        .agg(n_pairs=("seed","size"),
-                delta_rmse_mean=("delta_rmse","mean"),
-                delta_rmse_pct_mean=("delta_rmse_pct","mean"),
-                delta_mae_mean=("delta_mae","mean"),
-                delta_tod_mean=("delta_tod","mean")))
-    _atomic_write_csv(agg, summary_csv)
-    return agg
+    if out_rows:
+        out = pd.DataFrame(out_rows)
+        _atomic_write(out, _ensure_dir(summary_csv))
 
 
 # ============================================================
-# 4) Perturb Δ Bar (원인 지표 Δ: TOD / PEAK)
+# 4) Perturb delta‑bar (원인 지표 Δ)
+#    - ETTm2: {gc_kernel_tod_dcor, gc_feat_tod_dcor, gc_feat_tod_r2}
+#    - ETTh2: {cg_event_gain, |cg_bestlag|, cg_spearman_mean}
 # ============================================================
 def rebuild_w3_perturb_delta_bar(
     results_csv: str | Path,
-    out_dir: str | Path,
-    baseline_mode: str = "none",
-    group_keys: Tuple[str,...] = ("experiment_type","dataset","horizon"),
-) -> pd.DataFrame:
-    """
-    results_W3.csv에서 baseline('none')과 perturbed('tod_shift','smooth')를
-    (experiment_type,dataset,horizon,seed)로 매칭해 Δ를 계산.
-      - A4-TOD : Δ(gc_kernel_tod_dcor), Δ(gc_feat_tod_dcor), Δ(gc_feat_tod_r2)
-      - A4-PEAK: Δ(cg_event_gain), Δ(|cg_bestlag|), Δ(cg_spearman_mean)
-    detail/summary 모두 생성. pandas FutureWarning 제거.
-    """
-    results_csv = Path(results_csv)
-    if not results_csv.exists():
-        return pd.DataFrame()
-    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    detail_csv: str | Path,
+    summary_csv: str | Path,
+) -> None:
+    import pandas as pd, numpy as np
+    rpath = Path(results_csv)
+    if not rpath.exists(): return
+    R = pd.read_csv(rpath)
+    if R.empty: return
 
-    df = pd.read_csv(results_csv)
-    # 필수 컬럼 보정
-    for c in list(group_keys)+["seed","mode"]:
-        if c not in df.columns:
-            raise ValueError(f"rebuild_w3_perturb_delta_bar: missing key column '{c}' in results_W3.csv")
+    # baseline vs perturbed merge
+    base = R[R["mode"]=="none"]
+    pert = R[R["mode"]!="none"]
+    key_cols = ["experiment_type","dataset","horizon","seed","model_tag"]
+    M = pert.merge(base, on=key_cols, suffixes=("_p","_b"), how="left")
+    if M.empty: 
+        # 덮어쓰기(빈 파일이라도 유지)
+        _atomic_write(pd.DataFrame(columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"]),
+                      _ensure_dir(detail_csv))
+        _atomic_write(pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"]),
+                      _ensure_dir(summary_csv))
+        return
 
-    # 수치 컬럼 지정 및 보강
-    num_cols = [
-        "cg_event_gain","cg_bestlag","cg_spearman_mean",
-        "gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2"
-    ]
-    for c in num_cols:
-        if c not in df.columns:
-            df[c] = np.nan
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    detail_rows: List[Dict[str,Any]] = []
 
-    def _pair(pert: str, metrics: List[str]) -> pd.DataFrame:
-        per = df[df["mode"].astype(str) == pert].copy()
-        base= df[df["mode"].astype(str) == baseline_mode].copy()
-        on = list(group_keys) + ["seed"]
-        if per.empty or base.empty:
-            return pd.DataFrame(columns=list(group_keys)+["seed","perturbation","metric","delta"])
-        m = per.merge(base[on + metrics], on=on, how="inner", suffixes=("_per","_base"))
-        if m.empty:
-            return pd.DataFrame(columns=list(group_keys)+["seed","perturbation","metric","delta"])
+    def _emit_delta(rows, dataset, perturb, metric, delta_val):
+        rows.append({
+            "experiment_type": "W3",
+            "dataset": dataset,
+            "horizon": int(perturb_row["horizon_p"]),
+            "seed": int(perturb_row["seed"]),
+            "perturbation": perturb,
+            "metric": metric,
+            "delta": float(delta_val),
+        })
 
-        rows = []
-        for _, r in m.iterrows():
-            for met in metrics:
-                x = _to_f32(r[f"{met}_per"]); y = _to_f32(r[f"{met}_base"])
-                if not np.isfinite(x) or not np.isfinite(y):
-                    d = np.nan
-                elif met == "cg_bestlag":
-                    d = float(abs(x) - abs(y))  # |lag| 증가 기대(PEAK)
-                else:
-                    d = float(x - y)           # per - base
-                rows.append({
-                    **{k: r[k] for k in group_keys},
-                    "seed": int(r["seed"]),
-                    "perturbation": pert,
-                    "metric": met,
-                    "delta": _to_f32(d),
+    for _, perturb_row in M.iterrows():
+        ds = str(perturb_row["dataset_p"])
+        perturb = str(perturb_row["mode_p"])
+        if perturb == "tod_shift":
+            for m in ["gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2"]:
+                vp = float(perturb_row.get(m+"_p", np.nan))
+                vb = float(perturb_row.get(m+"_b", np.nan))
+                if np.isfinite(vp) and np.isfinite(vb):
+                    detail_rows.append({
+                        "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
+                        "seed":int(perturb_row["seed"]),"perturbation":"tod_shift",
+                        "metric":m,"delta":float(vp - vb)
+                    })
+        elif perturb == "smooth":
+            vp = float(perturb_row.get("cg_event_gain_p", np.nan))
+            vb = float(perturb_row.get("cg_event_gain_b", np.nan))
+            if np.isfinite(vp) and np.isfinite(vb):
+                detail_rows.append({
+                    "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
+                    "seed":int(perturb_row["seed"]),"perturbation":"smooth",
+                    "metric":"cg_event_gain","delta":float(vp - vb)
                 })
-        return pd.DataFrame(rows)
+            # |bestlag|
+            vp = float(perturb_row.get("cg_bestlag_p", np.nan))
+            vb = float(perturb_row.get("cg_bestlag_b", np.nan))
+            if np.isfinite(vp) and np.isfinite(vb):
+                detail_rows.append({
+                    "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
+                    "seed":int(perturb_row["seed"]),"perturbation":"smooth",
+                    "metric":"cg_bestlag","delta":float(abs(vp) - abs(vb))
+                })
+            # spearman
+            vp = float(perturb_row.get("cg_spearman_mean_p", np.nan))
+            vb = float(perturb_row.get("cg_spearman_mean_b", np.nan))
+            if np.isfinite(vp) and np.isfinite(vb):
+                detail_rows.append({
+                    "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
+                    "seed":int(perturb_row["seed"]),"perturbation":"smooth",
+                    "metric":"cg_spearman_mean","delta":float(vp - vb)
+                })
 
-    # A4-TOD (ETTm2): TOD 관련 지표 Δ
-    tod_metrics  = ["gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2"]
-    tod_detail   = _pair("tod_shift", tod_metrics)
-
-    # A4-PEAK (ETTh2): 이벤트/라그/스피어만 Δ
-    peak_metrics = ["cg_event_gain","cg_bestlag","cg_spearman_mean"]
-    peak_detail  = _pair("smooth", peak_metrics)
-
-    frames = [x for x in [tod_detail, peak_detail] if x is not None and len(x) > 0]
-    if frames:
-        detail = pd.concat(frames, ignore_index=True)
-        detail["delta"] = pd.to_numeric(detail["delta"], errors="coerce")
-        _append_or_update_rows(Path(out_dir)/"perturb_delta_bar_detail.csv",
-                               detail.to_dict("records"),
-                               subset_keys=list(group_keys)+["seed","perturbation","metric"])
-
-        # summary: 평균 + n (FutureWarning 회피: as_index=False)
-        summary = (detail
-                   .groupby(list(group_keys)+["perturbation","metric"], as_index=False)
-                   .agg(delta_mean=("delta","mean"),
-                        n=("delta","size")))
-        _atomic_write_csv(summary, Path(out_dir)/"perturb_delta_bar_summary.csv")
-        return summary
+    # detail 저장
+    if detail_rows:
+        D = pd.DataFrame(detail_rows)
     else:
-        # detail이 비면 summary도 빈 파일로 초기화
-        empty = pd.DataFrame(columns=list(group_keys)+["perturbation","metric","delta_mean","n"])
-        _atomic_write_csv(empty, Path(out_dir)/"perturb_delta_bar_summary.csv")
-        return empty
+        D = pd.DataFrame(columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"])
+    _atomic_write(D, _ensure_dir(detail_csv))
+
+    # summary 저장 (pandas FutureWarning 회피)
+    if not D.empty:
+        S = (D.groupby(["experiment_type","dataset","horizon","perturbation","metric"], as_index=False, group_keys=False)
+               .agg(delta_mean=("delta","mean"), n=("delta","size")))
+    else:
+        S = pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"])
+    _atomic_write(S, _ensure_dir(summary_csv))
