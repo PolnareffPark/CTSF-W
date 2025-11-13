@@ -76,3 +76,12 @@ experiment:
   horizons: [96,192,336,720]
   datasets: ["ETTm1","ETTm2","ETTh1","ETTh2","weather"]
   cross_mode: "both"                         # {"both","gc_only","cg_only","none"} 토글
+
+# W3 전용 (없어도 실행되지만, 여기에 두면 강도/확률을 쉽게 조절 가능)
+perturb_cfg:
+  ETTm2:
+    tod_shift: { max_shift: 8 }       # ±8 bin
+    smooth:    { kernel: 3, alpha: 0.25 }
+  ETTh2:
+    tod_shift: { max_shift: 2 }       # ±2 bin
+    smooth:    { kernel: 5, alpha: 0.35 }
