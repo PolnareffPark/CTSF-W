@@ -165,7 +165,7 @@ class _W3PerturbWrapper(nn.Module):
 
     def __init__(self, base: nn.Module, mode: str, dataset: str, perturb_cfg: Optional[Dict[str, Any]] = None):
         super().__init__()
-        self.base = base
+        self.add_module("base", base)
         self.mode = str(mode or "none")
         self.dataset = str(dataset or "")
         self.cfg = perturb_cfg.copy() if isinstance(perturb_cfg, dict) else _default_perturb_cfg(dataset)
@@ -188,13 +188,25 @@ class _W3PerturbWrapper(nn.Module):
         return self.base(x, *args, **kwargs)
 
     def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            base = object.__getattribute__(self, "base")
-            if hasattr(base, name):
-                return getattr(base, name)
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        """
+        래퍼에 없는 속성은 항상 내부 base 모듈로 위임.
+        단, 'base' 자체를 요청하면 base 모듈을 직접 반환.
+        """
+        modules = object.__getattribute__(self, "_modules")
+        base = modules.get("base")
+        if base is None:
+            raise AttributeError(
+                f"{self.__class__.__name__} has no registered 'base' submodule"
+            )
+        # 'base' 속성 자체를 요청하면 base 모듈을 반환
+        if name == "base":
+            return base
+        # 그 외 속성은 base에 위임
+        return getattr(base, name)
+
+    def unwrap(self) -> nn.Module:
+        """내부 원본 모델을 반환."""
+        return self.base  # __getattr__을 통해 안전하게 접근
 
     @torch.no_grad()
     def _apply_tod_shift(self, x: torch.Tensor) -> torch.Tensor:
@@ -220,6 +232,20 @@ class _W3PerturbWrapper(nn.Module):
         smoothed = _moving_avg_1d(x, kernel, time_axis)
         return (1.0 - alpha) * x + alpha * smoothed
 
+def _unwrap_model(m: nn.Module) -> nn.Module:
+    """
+    _W3PerturbWrapper / DataParallel / DDP 등 래핑을 벗겨 순수 베이스 모델을 얻는다.
+    """
+    cur = m
+    while True:
+        if isinstance(cur, _W3PerturbWrapper):
+            cur = cur.unwrap()
+            continue
+        if hasattr(cur, "module"):  # DP/DDP 호환
+            cur = cur.module
+            continue
+        break
+    return cur
 
 # ---------------------------------------------------------------------------
 # W3 Experiment
@@ -269,8 +295,11 @@ class W3Experiment(BaseExperiment):
         except Exception:
             tod_vec = None
 
+        # 언랩된 모델
+        model_for_analysis = _unwrap_model(self.model)
+
         direct = evaluate_with_direct_evidence(
-            self.model,
+            model_for_analysis,        # <-- 언랩된 모델 전달
             self.test_loader,
             self.mu,
             self.std,
@@ -284,7 +313,7 @@ class W3Experiment(BaseExperiment):
         try:
             exp_specific = compute_all_experiment_metrics(
                 experiment_type=EXP_TAG,
-                model=self.model,
+                model=model_for_analysis,   # <-- 언랩된 모델 전달
                 hooks_data=hooks if hooks else None,
                 tod_vec=tod_vec,
                 direct_evidence=direct,
