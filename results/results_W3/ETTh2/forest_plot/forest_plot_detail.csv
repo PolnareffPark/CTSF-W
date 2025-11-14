@@ -1,0 +1,4 @@
+experiment_type,dataset,plot_type,horizon,seed,mode,model_tag,run_tag,rmse_real,mae_real
+W3,ETTh2,forest_plot,96,42,none,HyperConv,W3_ETTh2_96_42_none,3.603928853974406,2.369382858276367
+W3,ETTh2,forest_plot,96,42,tod_shift,HyperConv,W3_ETTh2_96_42_tod_shift,3.616750736109138,2.382307529449463
+W3,ETTh2,forest_plot,96,42,smooth,HyperConv,W3_ETTh2_96_42_smooth,3.607093915917565,2.371981143951416
