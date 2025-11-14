@@ -55,17 +55,19 @@ def _default_perturb_cfg(dataset: str) -> Dict[str, Any]:
     ds = (dataset or "").lower()
     if "ettm2" in ds:
         return {
-            "tod_shift": {"max_shift": 8},
-            "smooth": {"kernel": 3, "alpha": 0.25},
+            "tod_shift": {"max_shift": 16, "seg_perm_k": 4, "per_channel_jitter": 2, "sdiff_beta": 0.15},
+            "smooth":    {"kernel": 7,  "alpha": 0.5},  # ETTm2는 smooth 가 보조 역할
         }
     if "etth2" in ds:
         return {
-            "tod_shift": {"max_shift": 2},
-            "smooth": {"kernel": 5, "alpha": 0.35},
+            "tod_shift": {"max_shift": 4, "seg_perm_k": 3, "per_channel_jitter": 1}, # ETTh2 는 tod_shift 가 보조 역할할
+            "smooth":    {"kernel": 7,  "alpha": 0.6},  # 피크 완화 강화
         }
+    # 기타 데이터셋 (ETTm1, ETTh1, weather 등)
+    tod_bins = _infer_tod_bins(dataset)
     return {
-        "tod_shift": {"max_shift": max(1, _infer_tod_bins(dataset) // 48)},
-        "smooth": {"kernel": 3, "alpha": 0.25},
+        "tod_shift": {"max_shift": max(1, tod_bins // 48), "seg_perm_k": 0, "per_channel_jitter": 0, "sdiff_beta": 0.0},
+        "smooth":    {"kernel": 5, "alpha": 0.3},
     }
 
 
@@ -74,6 +76,9 @@ def _detect_layout(x: torch.Tensor) -> Tuple[int, int]:
     입력 텐서의 시간축/채널축을 추정.
     허용 형태: (B, L, C) 혹은 (B, C, L)
     반환: (time_axis, channel_axis)
+    
+    일반적으로 시계열 길이(L)가 채널 수(C)보다 크다고 가정.
+    L == C인 경우 (B, L, C)로 해석합니다.
     """
     if x.dim() != 3:
         raise ValueError("W3 wrapper expects 3D input (B, L, C) or (B, C, L).")
@@ -83,28 +88,28 @@ def _detect_layout(x: torch.Tensor) -> Tuple[int, int]:
     return 2, 1  # (B, C, L)
 
 
-def _moving_avg_1d(x: torch.Tensor, k: int, t_axis: int) -> torch.Tensor:
-    """시간축 기준 이동평균을 적용."""
-    if k <= 1:
-        return x
-    if k % 2 == 0:
-        k += 1  # 홀수 강제
-
-    if t_axis == 1:  # (B, L, C)
-        x_nc_t = x.permute(0, 2, 1)  # (B, C, L)
-    else:
-        x_nc_t = x  # (B, C, L)
-
-    b, c, L = x_nc_t.shape
-    weight = torch.ones(1, 1, k, device=x.device, dtype=x.dtype) / float(k)
-    x_flat = x_nc_t.reshape(b * c, 1, L)
-    pad = k // 2
-    x_pad = F.pad(x_flat, (pad, pad), mode="reflect")
-    y = F.conv1d(x_pad, weight).reshape(b, c, L)
-
-    if t_axis == 1:
-        return y.permute(0, 2, 1)
-    return y
+# def _moving_avg_1d(x: torch.Tensor, k: int, t_axis: int) -> torch.Tensor:
+#     """시간축 기준 이동평균을 적용. (현재 미사용)"""
+#     if k <= 1:
+#         return x
+#     if k % 2 == 0:
+#         k += 1  # 홀수 강제
+#
+#     if t_axis == 1:  # (B, L, C)
+#         x_nc_t = x.permute(0, 2, 1)  # (B, C, L)
+#     else:
+#         x_nc_t = x  # (B, C, L)
+#
+#     b, c, L = x_nc_t.shape
+#     weight = torch.ones(1, 1, k, device=x.device, dtype=x.dtype) / float(k)
+#     x_flat = x_nc_t.reshape(b * c, 1, L)
+#     pad = k // 2
+#     x_pad = F.pad(x_flat, (pad, pad), mode="reflect")
+#     y = F.conv1d(x_pad, weight).reshape(b, c, L)
+#
+#     if t_axis == 1:
+#         return y.permute(0, 2, 1)
+#     return y
 
 
 def _append_or_update_results(csv_path: Path | str, row: Dict[str, Any], subset: List[str]) -> None:
@@ -168,11 +173,17 @@ class _W3PerturbWrapper(nn.Module):
         self.add_module("base", base)
         self.mode = str(mode or "none")
         self.dataset = str(dataset or "")
-        self.cfg = perturb_cfg.copy() if isinstance(perturb_cfg, dict) else _default_perturb_cfg(dataset)
-
+        
+        # 기본값 가져오기
         defaults = _default_perturb_cfg(dataset)
-        for key, value in defaults.items():
-            self.cfg.setdefault(key, value)
+        
+        # 사용자 제공 값이 있으면 복사 후 기본값으로 채우기, 없으면 기본값 사용
+        if isinstance(perturb_cfg, dict):
+            self.cfg = perturb_cfg.copy()
+            for key, value in defaults.items():
+                self.cfg.setdefault(key, value)
+        else:
+            self.cfg = defaults
 
         self.tod_bins = _infer_tod_bins(self.dataset)
 
@@ -210,27 +221,105 @@ class _W3PerturbWrapper(nn.Module):
 
     @torch.no_grad()
     def _apply_tod_shift(self, x: torch.Tensor) -> torch.Tensor:
-        time_axis, _ = _detect_layout(x)
-        max_shift = int(self.cfg.get("tod_shift", {}).get("max_shift", 1))
-        if max_shift <= 0:
+        # ---- 강화된 정합 붕괴형 tod_shift ----
+        t_axis, c_axis = _detect_layout(x)               # (B,L,C) 또는 (B,C,L)
+        L = x.shape[t_axis]
+        if L < 8:                                        # 너무 짧으면 skip
             return x
 
-        shift = torch.randint(-max_shift, max_shift + 1, (1,), device=x.device).item()
-        if shift == 0 and max_shift > 0:
-            shift = 1
-        if shift == 0:
-            return x
-        return torch.roll(x, shifts=shift, dims=time_axis)
+        cfg = self.cfg.get("tod_shift", {}) or {}
+        max_shift = int(cfg.get("max_shift", 8))         # ETTm2: 8→12~24 권장
+        seg_k = int(cfg.get("seg_perm_k", 4))            # 세그먼트 수(4 권장)
+        ch_jitter = int(cfg.get("per_channel_jitter", 2))# 채널별 ±jitter(0~2)
+        mix_beta = float(cfg.get("sdiff_beta", 0.0))     # 0.0~0.25 권장
+
+        # 1) 기본 원형 roll(전구간)
+        if max_shift > 0:
+            shift = torch.randint(-max_shift, max_shift + 1, (1,), device=x.device).item()
+            if shift != 0:
+                x = torch.roll(x, shifts=shift, dims=t_axis)
+
+        # 2) 구간 퍼뮤테이션(세그먼트 순열)
+        if seg_k > 1 and L >= seg_k:
+            seg_len = L // seg_k
+            remainder = L % seg_k
+            
+            # 세그먼트 경계 계산
+            segments = []
+            start = 0
+            for i in range(seg_k):
+                end = start + seg_len + (1 if i < remainder else 0)
+                segments.append((start, end))
+                start = end
+            
+            # 무작위 순열
+            order = torch.randperm(seg_k, device=x.device).tolist()
+            
+            # 세그먼트 재배열
+            if t_axis == 1:  # (B, L, C)
+                chunks = [x[:, segments[i][0]:segments[i][1], :] for i in order]
+                x = torch.cat(chunks, dim=1)
+            else:  # (B, C, L)
+                chunks = [x[:, :, segments[i][0]:segments[i][1]] for i in order]
+                x = torch.cat(chunks, dim=2)
+
+        # 3) 채널별 미세 시프트(동조성 약화)
+        if ch_jitter > 0:
+            # 각 채널 별로 독립 시프트
+            if t_axis == 1:   # (B,L,C) → (B,C,L)
+                x_nc_t = x.permute(0, 2, 1)
+            else:
+                x_nc_t = x  # (B,C,L)
+            B, C, LL = x_nc_t.shape
+            if C > 1:  # 채널이 1개 이상일 때만 적용
+                j = torch.randint(-ch_jitter, ch_jitter + 1, (C,), device=x.device)
+                for c in range(C):
+                    s = int(j[c].item())
+                    if s != 0:
+                        x_nc_t[:, c, :] = torch.roll(x_nc_t[:, c, :], shifts=s, dims=-1)
+            x = x_nc_t.permute(0, 2, 1) if t_axis == 1 else x_nc_t
+
+        # 4) 약한 seasonal differencing 혼합(선택)
+        if mix_beta > 1e-8 and L > self.tod_bins:
+            # mix_beta 클램핑 (0.0 ~ 0.3 권장)
+            mix_beta = min(mix_beta, 0.3)
+            P = self.tod_bins  # ETTm=96 / ETTh=24
+            x = (1.0 - mix_beta) * x + mix_beta * (x - torch.roll(x, shifts=P, dims=t_axis))
+        return x
+
 
     @torch.no_grad()
     def _apply_smooth(self, x: torch.Tensor) -> torch.Tensor:
-        time_axis, _ = _detect_layout(x)
-        kernel = int(self.cfg.get("smooth", {}).get("kernel", 3))
-        alpha = float(self.cfg.get("smooth", {}).get("alpha", 0.25))
-        if kernel <= 1 or alpha <= 0:
+        # ---- 피크/급변 완화 강화형 smooth ----
+        t_axis, _ = _detect_layout(x)
+        cfg = self.cfg.get("smooth", {}) or {}
+        k = int(cfg.get("kernel", 7))                    # 7~9 권장
+        alpha = float(cfg.get("alpha", 0.6))             # 0.5~0.7 권장
+        if k <= 1 or alpha <= 0:
             return x
-        smoothed = _moving_avg_1d(x, kernel, time_axis)
-        return (1.0 - alpha) * x + alpha * smoothed
+        if k % 2 == 0: k += 1
+
+        # (A) 삼각 커널로 부드럽게
+        half = k // 2
+        # float32로 커널 생성 후 정규화
+        tri = torch.arange(1, half + 2, device=x.device, dtype=torch.float32)
+        weight = torch.cat([tri, tri.flip(0)[1:]]).view(1, 1, -1)  # [1,2,3,2,1] 형태
+        weight = weight / weight.sum()  # 정규화
+
+        # conv1d 적용을 위해 (B,C,L) 형태로 맞춤
+        if t_axis == 1:  # (B,L,C) → (B,C,L)
+            x_nc_t = x.permute(0, 2, 1)
+        else:
+            x_nc_t = x
+        B, C, L = x_nc_t.shape
+        x_flat = x_nc_t.reshape(B*C, 1, L)
+        pad = k // 2
+        x_pad = F.pad(x_flat, (pad, pad), mode="reflect")
+        y = F.conv1d(x_pad, weight).reshape(B, C, L)
+
+        # (B) 블렌딩
+        y = (1.0 - alpha) * x_nc_t + alpha * y
+        return y.permute(0, 2, 1) if t_axis == 1 else y
 
 def _unwrap_model(m: nn.Module) -> nn.Module:
     """
@@ -271,6 +360,7 @@ class W3Experiment(BaseExperiment):
 
         self._last_hooks_data: Dict[str, Any] = {}
         self._last_direct: Dict[str, Any] = {}
+        self._last_tod_vec: Optional[np.ndarray] = None
 
     def _create_model(self):
         """BaseExperiment 요구사항: 모델 인스턴스 생성."""
@@ -292,8 +382,10 @@ class W3Experiment(BaseExperiment):
     def evaluate_test(self) -> Dict[str, Any]:
         try:
             tod_vec = build_test_tod_vector(self.cfg)
+            self._last_tod_vec = tod_vec  # 저장
         except Exception:
             tod_vec = None
+            self._last_tod_vec = None
 
         # 언랩된 모델
         model_for_analysis = _unwrap_model(self.model)
@@ -321,8 +413,9 @@ class W3Experiment(BaseExperiment):
             )
             if exp_specific:
                 direct.update(exp_specific)
-        except Exception:
-            pass
+        except Exception as e:
+            import warnings
+            warnings.warn(f"W3 compute_all_experiment_metrics failed: {e}")
 
         self._last_hooks_data = copy.deepcopy(hooks)
         self._last_direct = copy.deepcopy(direct)
@@ -341,13 +434,15 @@ class W3Experiment(BaseExperiment):
     ) -> None:
         ctx = self._ctx(dataset, horizon, seed, mode, model_tag, run_tag)
 
+        # 디렉터리 준비
         forest_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "forest_plot"
         heatmap_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_tod_heatmap"
-        dist_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_distribution"
+        dist_dir   = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_distribution"
         forest_dir.mkdir(parents=True, exist_ok=True)
         heatmap_dir.mkdir(parents=True, exist_ok=True)
         dist_dir.mkdir(parents=True, exist_ok=True)
 
+        # 스칼라 성능치 정리 (rmse_real/mae_real)
         mse_real = direct.get("mse_real")
         rmse_direct = direct.get("rmse")
         try:
@@ -361,6 +456,7 @@ class W3Experiment(BaseExperiment):
         except Exception:
             mae_real = float("nan")
 
+        # forest detail (각 run의 실측 RMSE/MAE 기록)
         save_w3_forest_detail_row(
             {**ctx, "plot_type": "forest_plot"},
             rmse_real=rmse_real,
@@ -368,10 +464,8 @@ class W3Experiment(BaseExperiment):
             detail_csv=forest_dir / "forest_plot_detail.csv",
         )
 
-        try:
-            tod_vec = build_test_tod_vector(self.cfg)
-        except Exception:
-            tod_vec = None
+        # Gate‑TOD Heatmap / Gate 분포
+        tod_vec = self._last_tod_vec  # 재사용
 
         if tod_vec is not None:
             compute_and_save_w3_gate_tod_heatmap(
@@ -382,12 +476,14 @@ class W3Experiment(BaseExperiment):
                 out_dir=heatmap_dir,
                 amp_method="range",
             )
+
         compute_and_save_w3_gate_distribution(
             {**ctx, "plot_type": "gate_distribution"},
             hooks_data=hooks,
             out_dir=dist_dir,
         )
 
+        # results_W3.csv에 넣을 기본 행
         results_row: Dict[str, Any] = {
             "dataset": dataset,
             "horizon": horizon,
@@ -397,9 +493,48 @@ class W3Experiment(BaseExperiment):
             "experiment_type": EXP_TAG,
             "mse_real": float(mse_real) if mse_real is not None else np.nan,
             "rmse": rmse_real,
-            "mae": mae_real,
+            "mae":  mae_real,
         }
 
+        # --- win_errors: summary만 results에 기록, 원본 분포는 별도 detail로 저장 ---
+        we = direct.get("win_errors", None)
+        if isinstance(we, (list, tuple, np.ndarray)) and len(we) > 0:
+            w = np.asarray(we, float)
+            w = w[np.isfinite(w)]
+            if w.size > 0:
+                results_row["win_rmse_mean"] = float(np.nanmean(w))
+                results_row["win_rmse_std"]  = float(np.nanstd(w))
+                results_row["win_rmse_p95"]  = float(np.nanpercentile(w, 95))
+                results_row["win_rmse_max"]  = float(np.nanmax(w))
+                # run 별 원본 분포 저장 (append 모드)
+                win_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "window_errors"
+                win_dir.mkdir(parents=True, exist_ok=True)
+                win_csv = win_dir / "window_errors_detail.csv"
+                
+                dfw = pd.DataFrame({
+                    "dataset": [dataset]*w.size,
+                    "horizon": [horizon]*w.size,
+                    "seed": [seed]*w.size,
+                    "mode": [mode]*w.size,
+                    "model_tag": [model_tag]*w.size,
+                    "idx": np.arange(w.size),
+                    "rmse": w
+                })
+                
+                # append 또는 create
+                if win_csv.exists():
+                    old = pd.read_csv(win_csv)
+                    merged = pd.concat([old, dfw], ignore_index=True)
+                    # 같은 설정의 이전 run 제거
+                    subset = ["dataset", "horizon", "seed", "mode", "model_tag", "idx"]
+                    merged.drop_duplicates(subset=subset, keep="last", inplace=True)
+                    merged.to_csv(win_csv, index=False)
+                else:
+                    dfw.to_csv(win_csv, index=False)
+            # CSV에는 raw vector를 넣지 않음
+            direct.pop("win_errors", None)
+
+        # direct 나머지 스칼라/문자열 합류
         for key, value in direct.items():
             if key in results_row:
                 continue
@@ -414,6 +549,7 @@ class W3Experiment(BaseExperiment):
             subset=["dataset", "horizon", "seed", "mode", "model_tag", "experiment_type"],
         )
 
+        # 요약/Δ 리빌드 (데이터셋 폴더에 자신의 Δ만 쓰게 하려면 filter_dataset 인자 사용)
         perturb_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "perturb_delta_bar"
         perturb_dir.mkdir(parents=True, exist_ok=True)
 
@@ -423,10 +559,13 @@ class W3Experiment(BaseExperiment):
             gate_tod_summary_csv=heatmap_dir / "gate_tod_heatmap_summary.csv",
             group_keys=("experiment_type", "dataset", "horizon"),
         )
+
+        # w3_plotting_metrics.rebuild_w3_perturb_delta_bar가 filter_dataset 인자를 받도록
         rebuild_w3_perturb_delta_bar(
             results_csv=RESULTS_ROOT / f"results_{EXP_TAG}.csv",
             detail_csv=perturb_dir / "perturb_delta_bar_detail.csv",
             summary_csv=perturb_dir / "perturb_delta_bar_summary.csv",
+            filter_dataset=dataset,
         )
 
     def run(self):

@@ -84,39 +84,47 @@ def _stage_split_mean_per_sample(gates: np.ndarray) -> Dict[str, np.ndarray]:
     return {"S": ss, "M": mm, "D": dd}
 
 def _collect_gate_arrays_from_hooks(hooks_data: Dict[str,Any]) -> Optional[np.ndarray]:
-    """
-    hooks_data에서 gate_outputs(list of arrays) 우선 수집 → (N,L,G)로 연결
-    없으면 None
-    """
-    if not isinstance(hooks_data, dict): return None
+    if not isinstance(hooks_data, dict): 
+        return None
+
+    # 0) 우선순위: 이미 S/M/D로 집계된 값을 쓰자
+    for k in ("gates_by_stage","gate_by_stage","gate_logs_by_stage"):
+        stage_dict = hooks_data.get(k, None)
+        if isinstance(stage_dict, dict) and stage_dict:
+            out = {}
+            for st in ("S","M","D"):
+                a = stage_dict.get(st) or stage_dict.get(st.lower())
+                if a is None:
+                    continue
+                aa = np.asarray(a, float)
+                # (N, *) → (N,)으로 평균
+                out[st] = aa.reshape(aa.shape[0], -1).mean(axis=1)
+            if out:   # {'S':(N,), 'M':(N,), 'D':(N,)} 반환 신호
+                # 특별 반환 신호: dict를 담아 보내면 caller가 그대로 사용
+                out["_is_stage_dict"] = True
+                return out  # type: ignore
+
+    # 1) 원본 텐서(게이트 로그) 병합 → (N,L,G)
     src = None
     if "gate_outputs" in hooks_data and hooks_data["gate_outputs"]:
-        # list of (B,L,G) or (B,*,G)
         bags = []
         for a in hooks_data["gate_outputs"]:
             try:
                 a = np.asarray(a, float)
-                if a.ndim >= 2:
-                    if a.ndim == 2:  # (B,G)
-                        a = a.reshape(a.shape[0], 1, a.shape[1])
-                    elif a.ndim > 3:
-                        # (B,*,G) -> (B,L,G)
-                        L = int(np.prod(a.shape[1:-1]))
-                        a = a.reshape(a.shape[0], L, a.shape[-1])
+                if a.ndim == 2:   # (B,G) → (B,1,G)
+                    a = a.reshape(a.shape[0], 1, a.shape[1])
+                elif a.ndim > 3:  # (B,*,G) → (B,L,G)로 접기
+                    L = int(np.prod(a.shape[1:-1]))
+                    a = a.reshape(a.shape[0], L, a.shape[-1])
+                if a.ndim == 3:
                     bags.append(a)
             except Exception:
                 continue
-        if len(bags) > 0:
-            try:
-                src = np.concatenate(bags, axis=0)  # (N,L,G)
+        if bags:
+            try:    src = np.concatenate(bags, axis=0)
             except Exception:
+            # 실패 시 첫 번째만 사용
                 src = bags[0]
-    # stage dict가 별도로 있으면 병합(안전 평균)
-    for key in ("gates_by_stage","gate_by_stage","gate_logs_by_stage"):
-        if isinstance(hooks_data.get(key), dict) and hooks_data[key]:
-            # S/M/D를 평균해 (N,L=1,G)처럼 간주하여 src와 합쳐 평균
-            # 단, TOD 집계는 per‑sample 강도만 쓰므로 src가 없어도 stage 스플릿로 대체 가능
-            pass
     return src
 
 
@@ -138,56 +146,92 @@ def compute_and_save_w3_gate_tod_heatmap(
     if idx.size == 0:
         return
 
-    gates = _collect_gate_arrays_from_hooks(hooks_data)
-    if gates is None:
-        return
+    # 1) stage dict가 있으면 우선 사용
+    st: Dict[str, np.ndarray] = {}
+    for k in ("gates_by_stage","gate_by_stage","gate_logs_by_stage"):
+        sd = hooks_data.get(k, None)
+        if isinstance(sd, dict) and sd:
+            for stage in ("S","M","D"):
+                a = sd.get(stage) or sd.get(stage.lower())
+                if a is None:
+                    continue
+                aa = np.asarray(a, float)
+                aa = aa.reshape(aa.shape[0], -1).mean(axis=1)  # (N,*)→(N,)
+                st[stage] = aa
+            break
 
-    # 샘플별 stage 강도
-    st = _stage_split_mean_per_sample(gates)  # {'S':(N,), 'M':(N,), 'D':(N,)}
+    # 2) 없으면 원래 경로: gate_outputs → stage split
+    if not st:
+        gates = _collect_gate_arrays_from_hooks(hooks_data)
+        if gates is None:
+            return
+        st = _stage_split_mean_per_sample(np.asarray(gates, float))  # {'S':(N,), 'M':(N,), 'D':(N,)}
+
     rows: List[Dict[str,Any]] = []
     amp: Dict[str, float] = {"S": np.nan, "M": np.nan, "D": np.nan}
+    covered = np.zeros(T, dtype=bool)  # 어떤 stage든 sample이 존재한 TOD bin
 
     def _amp_fn(x: np.ndarray) -> float:
         x = np.asarray(x, float)
         x = x[np.isfinite(x)]
-        if x.size == 0: return np.nan
-        return float(np.nanstd(x) if amp_method=="std" else (np.nanmax(x)-np.nanmin(x)))
+        if x.size == 0:
+            return np.nan
+        return float(np.nanstd(x) if amp_method == "std"
+                     else (np.nanmax(x) - np.nanmin(x)))
 
+    # 3) stage별 TOD 집계
     for stage in ("S","M","D"):
-        if stage not in st: continue
-        v = np.asarray(st[stage], float)            # (N,)
-        bins = [[] for _ in range(T)]
+        v = np.asarray(st.get(stage), float)
+        if v.size == 0:
+            continue
+        bins: List[List[float]] = [[] for _ in range(T)]
         msk = np.isfinite(v)
-        for i, ok in enumerate(msk):
-            if not ok: continue
+        N = min(v.shape[0], idx.shape[0])
+        for i in range(N):
+            if not msk[i]:
+                continue
             j = int(idx[i])
             bins[j].append(float(v[i]))
-        means = [float(np.nan if len(b)==0 else np.mean(b)) for b in bins]
-        # detail
-        for t, mv in enumerate(means):
-            if np.isfinite(mv):
-                rows.append({
-                    **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-                    "tod": int(t), "stage": stage, "gate_mean": float(mv)
-                })
-        # amp
-        amp[stage] = _amp_fn(np.array([x for x in means if np.isfinite(x)], float))
 
-    # summary
+        means = [float(np.mean(b)) if len(b) > 0 else np.nan for b in bins]
+        counts = [int(len(b)) for b in bins]
+
+        # detail: 빈 bin도 NaN + sample_count로 기록
+        for t in range(T):
+            if counts[t] > 0:
+                covered[t] = True
+            mv = means[t]
+            rows.append({
+                **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+                "tod": int(t),
+                "stage": stage,
+                "gate_mean": float(mv) if np.isfinite(mv) else np.nan,
+                "sample_count": counts[t],
+            })
+
+        # amp
+        finite_means = [m for m in means if np.isfinite(m)]
+        amp[stage] = _amp_fn(np.array(finite_means, float)) if finite_means else np.nan
+
+    # 4) summary
+    valid_bins = int(covered.sum())
     summary_row = {
         **{k: ctx[k] for k in _W3_KEYS if k in ctx},
         "tod_bins": int(T),
         "tod_amp_s": amp.get("S", np.nan),
         "tod_amp_m": amp.get("M", np.nan),
         "tod_amp_d": amp.get("D", np.nan),
-        "tod_amp_mean": float(np.nanmean([v for v in amp.values() if np.isfinite(v)])) if any(np.isfinite(list(amp.values()))) else np.nan,
-        "valid_ratio": 1.0, "nan_count": 0,
-        "amp_method": amp_method
+        "tod_amp_mean": float(np.nanmean([v for v in amp.values() if np.isfinite(v)])) \
+                        if any(np.isfinite(list(amp.values()))) else np.nan,
+        "valid_ratio": float(valid_bins) / float(T),
+        "nan_count": int(T - valid_bins),
+        "amp_method": amp_method,
     }
-    _append_or_update_row(Path(out_dir)/"gate_tod_heatmap_summary.csv",
+
+    _append_or_update_row(Path(out_dir) / "gate_tod_heatmap_summary.csv",
                           summary_row, subset_keys=_W3_KEYS)
-    _append_or_update_rows(Path(out_dir)/"gate_tod_heatmap_detail.csv",
-                           rows, subset_keys=_W3_KEYS+["tod","stage"])
+    _append_or_update_rows(Path(out_dir) / "gate_tod_heatmap_detail.csv",
+                           rows, subset_keys=_W3_KEYS + ["tod", "stage"])
 
 
 # ============================================================
@@ -301,90 +345,92 @@ def rebuild_w3_perturb_delta_bar(
     results_csv: str | Path,
     detail_csv: str | Path,
     summary_csv: str | Path,
+    filter_dataset: Optional[str] = None,
 ) -> None:
     import pandas as pd, numpy as np
     rpath = Path(results_csv)
-    if not rpath.exists(): return
-    R = pd.read_csv(rpath)
-    if R.empty: return
 
-    # baseline vs perturbed merge
+    # 헤더만이라도 보장 생성하는 헬퍼
+    def _emit_empties():
+        _atomic_write(
+            pd.DataFrame(columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"]),
+            _ensure_dir(detail_csv)
+        )
+        _atomic_write(
+            pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"]),
+            _ensure_dir(summary_csv)
+        )
+
+    if not rpath.exists():
+        _emit_empties(); return
+
+    R = pd.read_csv(rpath)
+    if R.empty:
+        _emit_empties(); return
+
     base = R[R["mode"]=="none"]
     pert = R[R["mode"]!="none"]
     key_cols = ["experiment_type","dataset","horizon","seed","model_tag"]
     M = pert.merge(base, on=key_cols, suffixes=("_p","_b"), how="left")
-    if M.empty: 
-        # 덮어쓰기(빈 파일이라도 유지)
-        _atomic_write(pd.DataFrame(columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"]),
-                      _ensure_dir(detail_csv))
-        _atomic_write(pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"]),
-                      _ensure_dir(summary_csv))
-        return
+
+    # 현재 데이터셋 폴더에 쓰는 동안, 해당 데이터셋만 남겨 저장
+    if filter_dataset is not None:
+        M = M[M["dataset"].astype(str) == str(filter_dataset)]
+
+    if M.empty:
+        _emit_empties(); return
 
     detail_rows: List[Dict[str,Any]] = []
 
-    def _emit_delta(rows, dataset, perturb, metric, delta_val):
-        rows.append({
-            "experiment_type": "W3",
-            "dataset": dataset,
-            "horizon": int(perturb_row["horizon_p"]),
-            "seed": int(perturb_row["seed"]),
-            "perturbation": perturb,
-            "metric": metric,
-            "delta": float(delta_val),
-        })
+    for _, row in M.iterrows():
+        ds = str(row["dataset"])                 # 조인 키: 접미사 없음
+        pert_name = str(row.get("mode_p", ""))   # 비키: 접미사 사용
+        H = int(row["horizon"])                  # 조인 키: 접미사 없음
+        S = int(row["seed"])                     # 조인 키: 접미사 없음
 
-    for _, perturb_row in M.iterrows():
-        ds = str(perturb_row["dataset_p"])
-        perturb = str(perturb_row["mode_p"])
-        if perturb == "tod_shift":
+        if pert_name == "tod_shift":
             for m in ["gc_kernel_tod_dcor","gc_feat_tod_dcor","gc_feat_tod_r2"]:
-                vp = float(perturb_row.get(m+"_p", np.nan))
-                vb = float(perturb_row.get(m+"_b", np.nan))
+                vp = float(row.get(m+"_p", np.nan))
+                vb = float(row.get(m+"_b", np.nan))
                 if np.isfinite(vp) and np.isfinite(vb):
                     detail_rows.append({
-                        "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
-                        "seed":int(perturb_row["seed"]),"perturbation":"tod_shift",
-                        "metric":m,"delta":float(vp - vb)
+                        "experiment_type":"W3","dataset":ds,"horizon":H,"seed":S,
+                        "perturbation":"tod_shift","metric":m,"delta":float(vp - vb)
                     })
-        elif perturb == "smooth":
-            vp = float(perturb_row.get("cg_event_gain_p", np.nan))
-            vb = float(perturb_row.get("cg_event_gain_b", np.nan))
+
+        elif pert_name == "smooth":
+            # event_gain
+            vp = float(row.get("cg_event_gain_p", np.nan))
+            vb = float(row.get("cg_event_gain_b", np.nan))
             if np.isfinite(vp) and np.isfinite(vb):
                 detail_rows.append({
-                    "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
-                    "seed":int(perturb_row["seed"]),"perturbation":"smooth",
-                    "metric":"cg_event_gain","delta":float(vp - vb)
+                    "experiment_type":"W3","dataset":ds,"horizon":H,"seed":S,
+                    "perturbation":"smooth","metric":"cg_event_gain","delta":float(vp - vb)
                 })
             # |bestlag|
-            vp = float(perturb_row.get("cg_bestlag_p", np.nan))
-            vb = float(perturb_row.get("cg_bestlag_b", np.nan))
+            vp = float(row.get("cg_bestlag_p", np.nan))
+            vb = float(row.get("cg_bestlag_b", np.nan))
             if np.isfinite(vp) and np.isfinite(vb):
                 detail_rows.append({
-                    "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
-                    "seed":int(perturb_row["seed"]),"perturbation":"smooth",
-                    "metric":"cg_bestlag","delta":float(abs(vp) - abs(vb))
+                    "experiment_type":"W3","dataset":ds,"horizon":H,"seed":S,
+                    "perturbation":"smooth","metric":"cg_bestlag","delta":float(abs(vp) - abs(vb))
                 })
             # spearman
-            vp = float(perturb_row.get("cg_spearman_mean_p", np.nan))
-            vb = float(perturb_row.get("cg_spearman_mean_b", np.nan))
+            vp = float(row.get("cg_spearman_mean_p", np.nan))
+            vb = float(row.get("cg_spearman_mean_b", np.nan))
             if np.isfinite(vp) and np.isfinite(vb):
                 detail_rows.append({
-                    "experiment_type":"W3","dataset":ds,"horizon":int(perturb_row["horizon_p"]),
-                    "seed":int(perturb_row["seed"]),"perturbation":"smooth",
-                    "metric":"cg_spearman_mean","delta":float(vp - vb)
+                    "experiment_type":"W3","dataset":ds,"horizon":H,"seed":S,
+                    "perturbation":"smooth","metric":"cg_spearman_mean","delta":float(vp - vb)
                 })
 
-    # detail 저장
-    if detail_rows:
-        D = pd.DataFrame(detail_rows)
-    else:
-        D = pd.DataFrame(columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"])
+    D = pd.DataFrame(detail_rows) if detail_rows else pd.DataFrame(
+        columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"]
+    )
     _atomic_write(D, _ensure_dir(detail_csv))
 
-    # summary 저장 (pandas FutureWarning 회피)
     if not D.empty:
-        S = (D.groupby(["experiment_type","dataset","horizon","perturbation","metric"], as_index=False, group_keys=False)
+        S = (D.groupby(["experiment_type","dataset","horizon","perturbation","metric"], as_index=False)
                .agg(delta_mean=("delta","mean"), n=("delta","size")))
     else:
         S = pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"])
