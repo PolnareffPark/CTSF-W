@@ -1,0 +1,7 @@
+experiment_type,dataset,horizon,perturbation,metric,delta_mean,n
+W3,ETTm2,96,smooth,cg_bestlag,-0.05668218085106391,1
+W3,ETTm2,96,smooth,cg_event_gain,0.00697215754994529,1
+W3,ETTm2,96,smooth,cg_spearman_mean,0.006984833627939294,1
+W3,ETTm2,96,tod_shift,gc_feat_tod_dcor,-0.014204932463068809,1
+W3,ETTm2,96,tod_shift,gc_feat_tod_r2,0.0008418443972999009,1
+W3,ETTm2,96,tod_shift,gc_kernel_tod_dcor,-0.005120924497948098,1
