@@ -1,0 +1,2 @@
+experiment_type,dataset,horizon,seed,model_tag,mode,run_tag,n_windows,win_mse_mean,win_mse_std,win_mse_median,win_mse_p90,win_mse_p95,win_mse_max
+W3,ETTm2,96,42,HyperConv,none,W3_ETTm2_96_42_none,12032,8.774114731570428,6.699187837429056,7.064125061035156,16.92442054748535,23.507130813598614,46.89482498168945

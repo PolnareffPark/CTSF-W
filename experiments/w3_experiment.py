@@ -17,12 +17,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .base_experiment import BaseExperiment
-from data.dataset import build_test_tod_vector
-from models.ctsf_model import HybridTS
 from utils.direct_evidence import evaluate_with_direct_evidence
-from utils.experiment_metrics.all_metrics import compute_all_experiment_metrics
+from .base_experiment import BaseExperiment
+from models.ctsf_model import HybridTS
+from data.dataset import build_test_tod_vector
+from utils.experiment_plotting_metrics.w3_plotting_metrics import save_w3_window_errors_detail
 from utils.experiment_plotting_metrics.w3_plotting_metrics import (
     compute_and_save_w3_gate_distribution,
     compute_and_save_w3_gate_tod_heatmap,
@@ -89,52 +88,37 @@ def _detect_layout(x: torch.Tensor) -> Tuple[int, int]:
     return 2, 1  # (B, C, L)
 
 
-# def _moving_avg_1d(x: torch.Tensor, k: int, t_axis: int) -> torch.Tensor:
-#     """시간축 기준 이동평균을 적용. (현재 미사용)"""
-#     if k <= 1:
-#         return x
-#     if k % 2 == 0:
-#         k += 1  # 홀수 강제
-#
-#     if t_axis == 1:  # (B, L, C)
-#         x_nc_t = x.permute(0, 2, 1)  # (B, C, L)
-#     else:
-#         x_nc_t = x  # (B, C, L)
-#
-#     b, c, L = x_nc_t.shape
-#     weight = torch.ones(1, 1, k, device=x.device, dtype=x.dtype) / float(k)
-#     x_flat = x_nc_t.reshape(b * c, 1, L)
-#     pad = k // 2
-#     x_pad = F.pad(x_flat, (pad, pad), mode="reflect")
-#     y = F.conv1d(x_pad, weight).reshape(b, c, L)
-#
-#     if t_axis == 1:
-#         return y.permute(0, 2, 1)
-#     return y
+def _unwrap_model(m):
+    """
+    Safely unwrap wrapper/DP/DDP to get the pure base model.
+    - Unwraps _W3PerturbWrapper via .unwrap()
+    - Unwraps DataParallel/DistributedDataParallel via .module
+    """
+    try:
+        # local import to avoid top-level coupling
+        import torch.nn as nn  # noqa: F401
+    except Exception:
+        pass
 
+    cur = m
+    # Loop until no further unwrapping is possible
+    while True:
+        # 1) W3 perturb wrapper
+        if hasattr(cur, "unwrap") and callable(getattr(cur, "unwrap")):
+            nxt = cur.unwrap()
+            if nxt is not None and nxt is not cur:
+                cur = nxt
+                continue
 
-def _append_or_update_results(csv_path: Path | str, row: Dict[str, Any], subset: List[str]) -> None:
-    """results_W3.csv에 행을 추가하거나 동일 키(subset)로 갱신."""
-    path = Path(csv_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    new_df = pd.DataFrame([row])
+        # 2) torch DP/DDP containers
+        if hasattr(cur, "module"):
+            nxt = getattr(cur, "module")
+            if nxt is not None and nxt is not cur:
+                cur = nxt
+                continue
 
-    if path.exists():
-        old_df = pd.read_csv(path)
-        for col in new_df.columns:
-            if col not in old_df.columns:
-                old_df[col] = np.nan
-        for col in old_df.columns:
-            if col not in new_df.columns:
-                new_df[col] = np.nan
-        merged = pd.concat([old_df, new_df], ignore_index=True)
-        merged.drop_duplicates(subset=subset, keep="last", inplace=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        merged.to_csv(tmp_path, index=False)
-        tmp_path.replace(path)
-    else:
-        new_df.to_csv(path, index=False)
-
+        break
+    return cur
 
 def _merge_perturb_cfg(defaults: Dict[str, Any], overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     merged = copy.deepcopy(defaults)
@@ -561,235 +545,197 @@ class W3Experiment(BaseExperiment):
 
     def evaluate_test(self):
         """
-        W3 평가 루프 (패치 버전)
-        - 기존 평가 로직을 유지하면서 다음을 추가한다:
-        (A) 훈련 세트 기준 ACF@day / SNR_time (baseline vs. perturbed) 산출 및 저장
-        (B) window_errors 상세(분할 CSV) + 요약 CSV 저장, 그리고 Parquet 통합(메모리 안전)
-        (C) conv-GRU 정렬(align)·위상(phase) 지표 baseline/perturbed/delta 저장
-        (D) (필요시) results_W3.csv에 신규 칼럼 안전 병합(열 유니온, 부분 갱신)
+        W3: train 시에만 교란, test는 클린 평가.
+        '순차 실행' 전제를 지키며, 이 함수는 '현재 cfg의 mode'에 대해서만 평가/저장용 결과(dict)를 반환한다.
+        Baseline('none') → Perturbed('tod_shift'/'smooth') 순으로 별도 run에서 호출된다.
+
+        Returns:
+            direct (Dict): direct_evidence + 부가 메트릭(필요 시) 포함 사전
         """
+        # --- Local imports (avoid top-level changes) ---
         import numpy as _np
         from pathlib import Path as _Path
-
-        # --- 0) 기존 로직: 베이스라인/교란 평가 실행 -------------------------------
-        # NOTE: 아래 2줄은 기존 코드에서 사용하는 평가 호출을 그대로 둔다.
-        #       evaluate_with_direct_evidence(...) 호출과 compute_all_experiment_metrics(...) 병합,
-        #       그리고 baseline_direct / current_direct 생성은 기존 구현을 따른다.
-        baseline_direct, current_direct = self._evaluate_test_with_baseline_and_perturbed()
-
-        # --- 1) H1/H2: 훈련 세트 기준 ACF@day / SNR 주입 --------------------------
-        acf_snr = self._compute_train_acf_snr_for_w3()
-        # 키 네이밍: w3_acf_day_base / w3_acf_day_perturb / w3_intervention_effect_acf_day
-        #           w3_snr_time_base / w3_snr_time_perturb / w3_intervention_effect_snr_time
-        if acf_snr:
-            current_direct.update(acf_snr)
-
-        # --- 2) H6/H5: 정렬/위상(Align/Phase) 원시값 병행 저장 -------------------
-        # (cg_pearson_mean: conv/gru 미분 상관, cg_bestlag: 최적 랙)
         try:
-            _align_b = baseline_direct.get("cg_pearson_mean", _np.nan)
-            _align_p = current_direct.get("cg_pearson_mean", _np.nan)
-            current_direct["convgru_align_base"] = float(_align_b) if _align_b is not None else _np.nan
-            current_direct["convgru_align_pert"] = float(_align_p) if _align_p is not None else _np.nan
-            current_direct["convgru_align_delta"] = (
-                float(_align_p) - float(_align_b)
-                if _np.isfinite(_align_b) and _np.isfinite(_align_p) else _np.nan
-            )
-        except Exception:
-            pass
-
+            # strict: use dataset.py implementation (do NOT reimplement)
+            from data.dataset import build_test_tod_vector
+        except Exception as _e:
+            build_test_tod_vector = None
         try:
-            _phase_b = baseline_direct.get("cg_bestlag", _np.nan)
-            _phase_p = current_direct.get("cg_bestlag", _np.nan)
-            current_direct["convgru_phase_base"] = float(_phase_b) if _phase_b is not None else _np.nan
-            current_direct["convgru_phase_pert"] = float(_phase_p) if _phase_p is not None else _np.nan
-            current_direct["convgru_phase_delta"] = (
-                float(_phase_p) - float(_phase_b)
-                if _np.isfinite(_phase_b) and _np.isfinite(_phase_p) else _np.nan
-            )
-        except Exception:
-            pass
+            # direct evidence evaluation util
+            from utils.direct_evidence import evaluate_with_direct_evidence
+        except Exception as _e:
+            raise RuntimeError(f"Missing evaluate_with_direct_evidence: {_e}")
 
-        # --- 3) window_errors 상세/요약 저장 + 라벨(MSE) 교정 ---------------------
-        base_win = baseline_direct.pop("win_errors", None)
-        pert_win = current_direct.pop("win_errors", None)
-        if base_win is not None and pert_win is not None:
+        # --- Build ToD label vector for test (from dataset.py) ---
+        tod_vec = None
+        if build_test_tod_vector is not None:
             try:
-                # 저장 컨텍스트
-                ctx = {
-                    "dataset": str(getattr(self, "dataset_tag", self.cfg.get("dataset", ""))),
-                    "horizon": int(self.cfg.get("horizon", self.cfg.get("pred_len", 96))),
-                    "seed": int(self.cfg.get("seed", 0)),
-                    "model_tag": str(self.cfg.get("model_tag", getattr(self, "model_tag", "CTSF"))),
-                    "experiment_type": "W3",
-                    "mode": str(self.cfg.get("mode", self.cfg.get("perturbation", "none"))),
-                    "run_tag": str(getattr(self, "run_tag", f"{self.cfg.get('dataset','')}-h{self.cfg.get('horizon',96)}-s{self.cfg.get('seed',0)}-W3-{self.cfg.get('perturbation','none')}"))
-                }
-                # 안전 임포트 (패키지/상대 경로 모두 지원)
-                try:
-                    from utils.experiment_plotting_metrics import w3_plotting_metrics as _w3pm
-                except Exception:
-                    import utils.experiment_plotting_metrics.w3_plotting_metrics as _w3pm  # 로컬 실행시
+                tod_vec = build_test_tod_vector(self.cfg)
+            except Exception:
+                tod_vec = None
+        self._last_tod_vec = tod_vec  # cache for plotting
 
-                # per-(H,S) 분할 CSV + 요약 CSV + Parquet 통합
-                _w3pm.save_w3_window_errors_detail(
-                    ctx=ctx,
-                    base_errors=_np.asarray(base_win),
-                    pert_errors=_np.asarray(pert_win),
-                    perturbation=str(self.cfg.get("perturbation", "none")),
-                    out_root=str(self.cfg.get("out_root", "results")),
+        # --- Unwrap to the pure base model (for hooks/analysis) ---
+        model_for_analysis = _unwrap_model(self.model)
+
+        # --- Evaluate on clean test set (sequential: only current mode) ---
+        direct = evaluate_with_direct_evidence(
+            model_for_analysis,
+            self.test_loader,
+            self.mu,
+            self.std,
+            tod_vec=tod_vec,
+            device=self.device,
+            collect_gate_outputs=True,
+        )
+
+        # --- Keep hooks for downstream plotting ---
+        hooks = direct.pop("hooks_data", None) or {}
+        self._last_hooks_data = hooks
+        self._last_direct = dict(direct)  # shallow copy for safety
+
+        # --- Window error (per-window MSE) sequential handling -------------
+        # Sequential runner: each mode (none, tod_shift, smooth) runs independently.
+        # Each run saves its own window errors to the same CSV file (accumulation).
+        # The function save_w3_window_errors_detail handles accumulation automatically.
+        current_mode = str(self.cfg.get("mode", self.cfg.get("perturbation", "none")))
+        dataset = str(self.cfg.get("dataset") or getattr(self, "dataset_tag", ""))
+        horizon = int(self.cfg.get("horizon", self.cfg.get("pred_len", 96)))
+        seed = int(self.cfg.get("seed", 0))
+        model_tag = str(self.cfg.get("model_tag", getattr(self, "model_tag", "HyperConv")))
+        EXP_TAG = str(self.cfg.get("experiment_type", "W3"))
+        RESULTS_ROOT = _Path(self.cfg.get("out_root", "results"))
+
+        # Current run's per-window MSE vector
+        cur_win = direct.get("win_errors", None)
+
+        # Save window errors for current mode (will accumulate in the same CSV file)
+        if isinstance(cur_win, (list, tuple, _np.ndarray)):
+            try:
+                try:
+                    from utils.experiment_plotting_metrics.w3_plotting_metrics import save_w3_window_errors_detail
+                except Exception:
+                    from utils.experiment_plotting_metrics import w3_plotting_metrics as _w3pm
+                    save_w3_window_errors_detail = _w3pm.save_w3_window_errors_detail
+                    
+                save_w3_window_errors_detail(
+                    ctx={
+                        "experiment_type": EXP_TAG,
+                        "dataset": dataset,
+                        "horizon": horizon,
+                        "seed": seed,
+                        "model_tag": model_tag,
+                        "mode": current_mode,
+                        "run_tag": f"{EXP_TAG}_{dataset}_{horizon}_{seed}_{current_mode}",
+                    },
+                    errors=_np.asarray(cur_win, dtype=_np.float32),
+                    mode=current_mode,
+                    out_root=str(RESULTS_ROOT),
                 )
             except Exception as _e:
-                print(f"[W3] window_errors 저장 중 경고: {_e}")
+                print(f"[W3] Window-errors save skipped: {_e}")
 
-        # (선택) 요약 컬럼에서 win_rmse_* 라벨을 win_mse_*로 교정
-        for _old, _new in [("win_rmse_mean", "win_mse_mean"),
-                        ("win_rmse_std", "win_mse_std")]:
-            if _old in current_direct and _new not in current_direct:
-                current_direct[_new] = current_direct.pop(_old)
+        # We do not keep the raw vector inside 'direct' to avoid bloating CSV rows
+        direct.pop("win_errors", None)
 
-        # --- 4) (옵션) results_W3.csv에 신규 칼럼 병합(열 유니온/키 중복 업데이트) --
-        try:
-            # csv_logger가 신규 칼럼을 드롭하는 환경을 대비한 방어적 병합
-            results_csv = _Path(self.cfg.get("out_root", "results")) / "results_W3.csv"
-            self._append_or_update_results(results_csv, current_direct,
-                                        subset_keys=("dataset", "horizon", "seed", "mode", "model_tag", "experiment_type"))
-        except Exception as _e:
-            # csv_logger가 이미 모든 칼럼을 저장한다면 무시
-            print(f"[W3] results_W3.csv 보강(선택) 중 경고: {_e}")
+        return direct
 
-        return current_direct
+    def _after_eval_save(self,
+                        dataset: str,
+                        horizon: int,
+                        seed: int,
+                        mode: str,
+                        direct: Dict[str, Any],
+                        hooks: Dict[str, Any],
+                        model_tag: str,
+                        run_tag: str) -> None:
+        """
+        Persist artifacts for a single (sequential) run, then rebuild summaries.
 
-    def _after_eval_save(
-        self,
-        dataset: str,
-        horizon: int,
-        seed: int,
-        mode: str,
-        direct: Dict[str, Any],
-        hooks: Dict[str, Any],
-        model_tag: str,
-        run_tag: str,
-    ) -> None:
-        ctx = self._ctx(dataset, horizon, seed, mode, model_tag, run_tag)
-
-        # 디렉터리 준비
-        forest_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "forest_plot"
-        heatmap_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_tod_heatmap"
-        dist_dir   = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "gate_distribution"
+        - Forest detail row
+        - Gate-TOD heatmap (detail+summary)
+        - Gate distribution (quantiles)
+        - Window-errors: per-(H,S) CSV (baseline cached → perturbed writes paired detail)
+        - results_W3.csv row (with correct win_* MSE labels)
+        - Rebuild summaries & Δ-bars for current dataset
+        """
+        # ---- Output roots ----
+        out_dataset_root = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset
+        forest_dir = out_dataset_root / "forest"
+        heatmap_dir = out_dataset_root / "gate_tod_heatmap"
+        dist_dir = out_dataset_root / "gate_distribution"
+        win_dir = out_dataset_root / "window_errors"
         forest_dir.mkdir(parents=True, exist_ok=True)
         heatmap_dir.mkdir(parents=True, exist_ok=True)
         dist_dir.mkdir(parents=True, exist_ok=True)
+        win_dir.mkdir(parents=True, exist_ok=True)
 
-        # 스칼라 성능치 정리 (rmse_real/mae_real)
-        mse_real = direct.get("mse_real")
-        rmse_direct = direct.get("rmse")
-        try:
-            rmse_real = float(rmse_direct) if rmse_direct is not None else float(np.sqrt(float(mse_real)))
-        except Exception:
-            rmse_real = float("nan")
-
-        mae_direct = direct.get("mae", direct.get("mae_real"))
-        try:
-            mae_real = float(mae_direct) if mae_direct is not None else float("nan")
-        except Exception:
-            mae_real = float("nan")
-
-        # forest detail (각 run의 실측 RMSE/MAE 기록)
+        # ---- 1) Forest detail (rmse_real & mae_real are scalars) ----
+        rmse_real = float(np.sqrt(direct.get("mse_real", np.nan)))
+        mae_real = float(direct.get("mae", np.nan))
         save_w3_forest_detail_row(
-            {**ctx, "plot_type": "forest_plot"},
+            ctx=self._ctx(dataset, horizon, seed, mode, model_tag, run_tag, plot_type="forest_plot"),
             rmse_real=rmse_real,
             mae_real=mae_real,
             detail_csv=forest_dir / "forest_plot_detail.csv",
         )
 
-        # Gate‑TOD Heatmap / Gate 분포
-        tod_vec = self._last_tod_vec  # 재사용
-
-        if tod_vec is not None:
+        # ---- 2) Gate-TOD heatmap (detail + summary) ----
+        try:
             compute_and_save_w3_gate_tod_heatmap(
-                {**ctx, "plot_type": "gate_tod_heatmap"},
+                ctx=self._ctx(dataset, horizon, seed, mode, model_tag, run_tag, plot_type="gate_tod_heatmap"),
                 hooks_data=hooks,
-                tod_vec=tod_vec,
+                tod_vec=self._last_tod_vec,
                 dataset=dataset,
                 out_dir=heatmap_dir,
                 amp_method="range",
             )
+        except Exception as e:
+            print(f"[W3] gate_tod_heatmap skipped: {e}")
 
-        compute_and_save_w3_gate_distribution(
-            {**ctx, "plot_type": "gate_distribution"},
-            hooks_data=hooks,
-            out_dir=dist_dir,
-        )
+        # ---- 3) Gate distribution quantiles (optional/no-fail) ----
+        try:
+            compute_and_save_w3_gate_distribution(
+                ctx=self._ctx(dataset, horizon, seed, mode, model_tag, run_tag, plot_type="gate_distribution"),
+                hooks_data=hooks,
+                out_dir=dist_dir,
+            )
+        except Exception as e:
+            print(f"[W3] gate_distribution skipped: {e}")
 
-        # results_W3.csv에 넣을 기본 행
-        results_row: Dict[str, Any] = {
-            "dataset": dataset,
-            "horizon": horizon,
-            "seed": seed,
-            "mode": mode,
-            "model_tag": model_tag,
-            "experiment_type": EXP_TAG,
-            "mse_real": float(mse_real) if mse_real is not None else np.nan,
-            "rmse": rmse_real,
-            "mae":  mae_real,
+        # ---- 4) Window-errors: sequential handling (already saved in evaluate_test) ----
+        # Window errors are saved in evaluate_test() for each mode sequentially.
+        # Each run saves its own errors, and the function accumulates them in the same CSV file.
+        # No additional processing needed here.
+        # (The direct dict may still have win_errors, but we already saved it)
+        direct.pop("win_errors", None)
+
+        # ---- 5) Prepare results row & fix window-error label names to MSE ----
+        results_row = dict(direct)  # make a copy-like
+        # Old drafts sometimes had 'win_rmse_*' keys; convert to 'win_mse_*'
+        rename_map = {
+            "win_rmse_mean": "win_mse_mean",
+            "win_rmse_std": "win_mse_std",
+            "win_rmse_p95": "win_mse_p95",
+            "win_rmse_max": "win_mse_max",
+            "win_rmse_min": "win_mse_min",
+            "win_rmse_q05": "win_mse_q05",
+            "win_rmse_q50": "win_mse_q50",
+            "win_rmse_q95": "win_mse_q95",
         }
+        for k_old, k_new in rename_map.items():
+            if k_old in results_row and k_new not in results_row:
+                results_row[k_new] = results_row.pop(k_old)
 
-        # --- win_errors: summary만 results에 기록, 원본 분포는 별도 detail로 저장 ---
-        we = direct.get("win_errors", None)
-        if isinstance(we, (list, tuple, np.ndarray)) and len(we) > 0:
-            w = np.asarray(we, float)
-            w = w[np.isfinite(w)]
-            if w.size > 0:
-                results_row["win_rmse_mean"] = float(np.nanmean(w))
-                results_row["win_rmse_std"]  = float(np.nanstd(w))
-                results_row["win_rmse_p95"]  = float(np.nanpercentile(w, 95))
-                results_row["win_rmse_max"]  = float(np.nanmax(w))
-                # run 별 원본 분포 저장 (append 모드)
-                win_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "window_errors"
-                win_dir.mkdir(parents=True, exist_ok=True)
-                win_csv = win_dir / "window_errors_detail.csv"
-                
-                dfw = pd.DataFrame({
-                    "dataset": [dataset]*w.size,
-                    "horizon": [horizon]*w.size,
-                    "seed": [seed]*w.size,
-                    "mode": [mode]*w.size,
-                    "model_tag": [model_tag]*w.size,
-                    "idx": np.arange(w.size),
-                    "rmse": w
-                })
-                
-                # append 또는 create
-                if win_csv.exists():
-                    old = pd.read_csv(win_csv)
-                    merged = pd.concat([old, dfw], ignore_index=True)
-                    # 같은 설정의 이전 run 제거
-                    subset = ["dataset", "horizon", "seed", "mode", "model_tag", "idx"]
-                    merged.drop_duplicates(subset=subset, keep="last", inplace=True)
-                    merged.to_csv(win_csv, index=False)
-                else:
-                    dfw.to_csv(win_csv, index=False)
-            # CSV에는 raw vector를 넣지 않음
-            direct.pop("win_errors", None)
-
-        # direct 나머지 스칼라/문자열 합류
-        for key, value in direct.items():
-            if key in results_row:
-                continue
-            try:
-                results_row[key] = float(value)
-            except Exception:
-                results_row[key] = value
-
-        _append_or_update_results(
+        # ---- 6) Append/update results_W3.csv ----
+        self._append_or_update_results(
             RESULTS_ROOT / f"results_{EXP_TAG}.csv",
             results_row,
-            subset=["dataset", "horizon", "seed", "mode", "model_tag", "experiment_type"],
+            subset_keys=["dataset", "horizon", "seed", "mode", "model_tag", "experiment_type"],
         )
 
-        # 요약/Δ 리빌드 (데이터셋 폴더에 자신의 Δ만 쓰게 하려면 filter_dataset 인자 사용)
-        perturb_dir = RESULTS_ROOT / f"results_{EXP_TAG}" / dataset / "perturb_delta_bar"
+        # ---- 7) Rebuild summaries (only for this dataset scope) ----
+        perturb_dir = out_dataset_root / "perturb_delta_bar"
         perturb_dir.mkdir(parents=True, exist_ok=True)
 
         rebuild_w3_forest_summary(
@@ -799,7 +745,6 @@ class W3Experiment(BaseExperiment):
             group_keys=("experiment_type", "dataset", "horizon"),
         )
 
-        # w3_plotting_metrics.rebuild_w3_perturb_delta_bar가 filter_dataset 인자를 받도록
         rebuild_w3_perturb_delta_bar(
             results_csv=RESULTS_ROOT / f"results_{EXP_TAG}.csv",
             detail_csv=perturb_dir / "perturb_delta_bar_detail.csv",
