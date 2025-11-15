@@ -9,36 +9,65 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 _W3_KEYS = ["experiment_type","dataset","plot_type","horizon","seed","mode","model_tag","run_tag"]
 
 def _ensure_dir(p: str | Path) -> Path:
-    p = Path(p); p.parent.mkdir(parents=True, exist_ok=True); return p
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
-def _atomic_write(df: pd.DataFrame, path: Path) -> None:
+def _atomic_write_csv(path: str | Path, df: pd.DataFrame) -> None:
+    """Atomic CSV write (single temp file, then replace)."""
+    path = _ensure_dir(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_csv(tmp, index=False); tmp.replace(path)
+    df.to_csv(tmp, index=False)
+    tmp.replace(path)
+
+def _append_or_update_row(csv_path: str | Path, row: Dict[str,Any], subset_keys: List[str]) -> None:
+    """Append (or overwrite) a single row based on subset_keys."""
+    path = _ensure_dir(csv_path)
+    new = pd.DataFrame([row])
+    if path.exists():
+        old = pd.read_csv(path)
+        # column union (keeps backward/forward compat)
+        for c in new.columns:
+            if c not in old.columns:
+                old[c] = np.nan
+        for c in old.columns:
+            if c not in new.columns:
+                new[c] = np.nan
+        # overwrite-by-key (drop duplicates on key set, keep last)
+        mask = np.ones(len(old), dtype=bool)
+        for k in subset_keys:
+            mask &= (old.get(k) == row.get(k))
+        out = pd.concat([old[~mask], new], ignore_index=True)
+    else:
+        out = new
+    _atomic_write_csv(path, out)
 
 def _append_or_update_rows(csv_path: str | Path, rows: List[Dict[str,Any]], subset_keys: List[str]) -> None:
-    if not rows: return
+    """Append (or overwrite) many rows based on subset_keys."""
+    if not rows:
+        return
     path = _ensure_dir(csv_path)
     new = pd.DataFrame(rows)
     if path.exists():
         old = pd.read_csv(path)
-        # union
+        # column union
         for c in new.columns:
-            if c not in old.columns: old[c] = np.nan
+            if c not in old.columns:
+                old[c] = np.nan
         for c in old.columns:
-            if c not in new.columns: new[c] = np.nan
-        df = pd.concat([old, new], ignore_index=True)
-        df.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
-        _atomic_write(df, path)
+            if c not in new.columns:
+                new[c] = np.nan
+        out = pd.concat([old, new], ignore_index=True)
+        out.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
     else:
-        new.drop_duplicates(subset=subset_keys, keep="last", inplace=True)
-        _atomic_write(new, path)
-
-def _append_or_update_row(csv_path: str | Path, row: Dict[str,Any], subset_keys: List[str]) -> None:
-    _append_or_update_rows(csv_path, [row], subset_keys)
+        out = new
+    _atomic_write_csv(path, out)
 
 def _infer_tod_bins(dataset: str) -> int:
     ds = (dataset or "").lower()
@@ -56,147 +85,168 @@ def _tod_index_from_vec(tod_vec: np.ndarray, T: int) -> np.ndarray:
         return np.array([], dtype=int)
     s = np.asarray(tod_vec[:, 0], float)
     c = np.asarray(tod_vec[:, 1], float)
-    ang = np.arctan2(s, c)  # [-pi, pi]
-    ang = (ang + 2*np.pi) % (2*np.pi)
+    ang = np.arctan2(s, c)                # [-pi, pi]
+    ang = (ang + 2*np.pi) % (2*np.pi)     # [0, 2pi)
     idx = np.floor(ang / (2*np.pi) * T).astype(int)
-    idx = np.clip(idx, 0, T-1)
-    return idx
+    return np.clip(idx, 0, T-1)
 
-def _stage_split_mean_per_sample(gates: np.ndarray) -> Dict[str, np.ndarray]:
+def _stage_split_mean_per_sample(gates_2d: np.ndarray) -> Dict[str, np.ndarray]:
     """
-    gates: (N, L, G) or (Batches ... concat) → 샘플축 N, 레이어축 L, gate축 G
-    반환: {'S': (N,), 'M': (N,), 'D': (N,)}
+    Fallback: split features equally into 3 stages along feature axis and average per sample.
+    gates_2d: (N, F_total)
+    return {'S': (N,), 'M': (N,), 'D': (N,)}
     """
-    if gates is None or not isinstance(gates, np.ndarray) or gates.ndim < 2:
+    x = np.asarray(gates_2d, float)
+    if x.ndim != 2 or x.shape[0] == 0 or x.shape[1] == 0:
         return {}
-    arr = np.asarray(gates, float)
-    if arr.ndim == 2:  # (N, G)
-        arr = arr.reshape(arr.shape[0], 1, arr.shape[1])
-    N, L, G = arr.shape[0], arr.shape[1], arr.shape[2]
-    if L <= 0:
-        return {}
-    # 레이어를 3분할
-    b1 = max(1, L // 3)
-    b2 = max(b1+1, (2*L)//3)
-    ss = arr[:, :b1, :].mean(axis=(1, 2))
-    mm = arr[:, b1:b2, :].mean(axis=(1, 2))
-    dd = arr[:, b2:,  :].mean(axis=(1, 2)) if b2 < L else arr[:, -1:, :].mean(axis=(1, 2))
-    return {"S": ss, "M": mm, "D": dd}
+    N, F = x.shape
+    s = F // 3
+    if s == 0:
+        # not enough features; use whole as 'D'
+        return {"D": x.mean(axis=1)}
+    aS = x[:, :s].mean(axis=1)
+    aM = x[:, s:2*s].mean(axis=1) if 2*s <= F else np.array([], float)
+    aD = x[:, 2*s:].mean(axis=1)  if 2*s  < F else np.array([], float)
+    out: Dict[str,np.ndarray] = {"S": aS}
+    if aM.size: out["M"] = aM
+    if aD.size: out["D"] = aD
+    return out
 
 def _collect_gate_arrays_from_hooks(hooks_data: Dict[str,Any]) -> Optional[np.ndarray]:
-    if not isinstance(hooks_data, dict): 
+    """
+    Try common keys to gather gate outputs from hooks. Return (N, F) as float if possible.
+    """
+    if not isinstance(hooks_data, dict):
         return None
-
-    # 0) 우선순위: 이미 S/M/D로 집계된 값을 쓰자
-    for k in ("gates_by_stage","gate_by_stage","gate_logs_by_stage"):
-        stage_dict = hooks_data.get(k, None)
-        if isinstance(stage_dict, dict) and stage_dict:
-            out = {}
-            for st in ("S","M","D"):
-                a = stage_dict.get(st) or stage_dict.get(st.lower())
-                if a is None:
-                    continue
-                aa = np.asarray(a, float)
-                # (N, *) → (N,)으로 평균
-                out[st] = aa.reshape(aa.shape[0], -1).mean(axis=1)
-            if out:   # {'S':(N,), 'M':(N,), 'D':(N,)} 반환 신호
-                # 특별 반환 신호: dict를 담아 보내면 caller가 그대로 사용
-                out["_is_stage_dict"] = True
-                return out  # type: ignore
-
-    # 1) 원본 텐서(게이트 로그) 병합 → (N,L,G)
-    src = None
-    if "gate_outputs" in hooks_data and hooks_data["gate_outputs"]:
-        bags = []
-        for a in hooks_data["gate_outputs"]:
-            try:
-                a = np.asarray(a, float)
-                if a.ndim == 2:   # (B,G) → (B,1,G)
-                    a = a.reshape(a.shape[0], 1, a.shape[1])
-                elif a.ndim > 3:  # (B,*,G) → (B,L,G)로 접기
-                    L = int(np.prod(a.shape[1:-1]))
-                    a = a.reshape(a.shape[0], L, a.shape[-1])
-                if a.ndim == 3:
-                    bags.append(a)
-            except Exception:
-                continue
-        if bags:
-            try:    src = np.concatenate(bags, axis=0)
-            except Exception:
-            # 실패 시 첫 번째만 사용
-                src = bags[0]
-    return src
-
+    cand_keys = ("gate_outputs","gates","gates_all","gate_logs")
+    buf: List[np.ndarray] = []
+    for k in cand_keys:
+        v = hooks_data.get(k, None)
+        if v is None:
+            continue
+        if isinstance(v, np.ndarray):
+            buf.append(np.asarray(v, float))
+        elif isinstance(v, list):
+            for a in v:
+                if isinstance(a, np.ndarray):
+                    buf.append(np.asarray(a, float))
+    if not buf:
+        return None
+    # reshape each to (N, -1), then concat along features; fall back to first on error
+    try:
+        parts = [a.reshape(a.shape[0], -1) for a in buf]
+        # align N to min length
+        n = min(p.shape[0] for p in parts)
+        parts = [p[:n] for p in parts]
+        out = np.concatenate(parts, axis=1)  # (N, F_total)
+    except Exception:
+        a0 = buf[0]
+        n = a0.shape[0]
+        out = a0.reshape(n, -1)
+    return out
 
 # ============================================================
 # 1) Gate‑TOD heatmap
 #    - 샘플별 gate 강도 ↔ 해당 샘플 TOD bin 으로 집계 (T=dataset별)
 # ============================================================
 def compute_and_save_w3_gate_tod_heatmap(
-    ctx: Dict[str,Any],                    # plot_type='gate_tod_heatmap'
-    hooks_data: Dict[str,Any],
-    tod_vec: np.ndarray,
-    dataset: str,
-    out_dir: str | Path,
-    amp_method: str = "range",
+    ctx: Dict[str, Any],                 # must include _W3_KEYS
+    hooks_data: Dict[str, Any],          # gate hooks or stage dict
+    tod_vec: np.ndarray,                 # (N,2) sin/cos TOD vector
+    dataset: str,                        # e.g., 'ETTm2', 'ETTh2'
+    out_dir: str | Path,                 # results/.../gate_tod_heatmap
+    amp_method: str = "range",           # 'range' | 'std'
 ) -> None:
-    assert ctx.get("plot_type") == "gate_tod_heatmap"
+    """
+    Fixes signature mismatch (critical) and performs robust TOD-binned gate aggregation.
+    - Summary: gate_tod_heatmap_summary.csv (tod_bins, tod_amp_s/m/d, tod_amp_mean, valid_ratio, nan_count)
+    - Detail : gate_tod_heatmap_detail.csv  (one row per (stage, tod), with gate_mean and sample_count)
+    """
+    assert ctx.get("plot_type") == "gate_tod_heatmap", "plot_type must be 'gate_tod_heatmap'"
+
+    # --- infer TOD bins & bin index from sin/cos vector
     T = _infer_tod_bins(dataset)
-    idx = _tod_index_from_vec(tod_vec, T)
-    if idx.size == 0:
+    idx = _tod_index_from_vec(np.asarray(tod_vec, float) if tod_vec is not None else np.array([], float), T)
+
+    # --- build stage-wise per-sample mean gates
+    # 1) if a stage dict exists in hooks, use it
+    st: Dict[str, np.ndarray] = {}
+    if isinstance(hooks_data, dict):
+        for k in ("gates_by_stage","gate_by_stage","gate_logs_by_stage"):
+            sd = hooks_data.get(k, None)
+            if isinstance(sd, dict) and sd:
+                for stage in ("S","M","D"):
+                    a = sd.get(stage) or sd.get(stage.lower())
+                    if a is None:
+                        continue
+                    aa = np.asarray(a, float)
+                    aa = aa.reshape(aa.shape[0], -1).mean(axis=1)  # (N,*) → (N,)
+                    st[stage] = aa
+                break
+
+    # 2) otherwise: collect generic gates → split into S/M/D
+    if not st:
+        gates2d = _collect_gate_arrays_from_hooks(hooks_data)
+        if gates2d is None:
+            # nothing to save → write a minimal summary with tod_bins=0
+            _append_or_update_row(
+                Path(out_dir) / "gate_tod_heatmap_summary.csv",
+                {
+                    **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+                    "tod_bins": 0, "tod_amp_s": np.nan, "tod_amp_m": np.nan, "tod_amp_d": np.nan,
+                    "tod_amp_mean": np.nan, "valid_ratio": 0.0, "nan_count": 0
+                },
+                subset_keys=_W3_KEYS
+            )
+            return
+        st = _stage_split_mean_per_sample(gates2d)  # {'S': (N,), 'M': (N,), 'D': (N,)}
+
+    # idx guard
+    if not isinstance(idx, np.ndarray) or idx.size == 0:
+        _append_or_update_row(
+            Path(out_dir) / "gate_tod_heatmap_summary.csv",
+            {
+                **{k: ctx[k] for k in _W3_KEYS if k in ctx},
+                "tod_bins": 0, "tod_amp_s": np.nan, "tod_amp_m": np.nan, "tod_amp_d": np.nan,
+                "tod_amp_mean": np.nan, "valid_ratio": 0.0, "nan_count": 0
+            },
+            subset_keys=_W3_KEYS
+        )
         return
 
-    # 1) stage dict가 있으면 우선 사용
-    st: Dict[str, np.ndarray] = {}
-    for k in ("gates_by_stage","gate_by_stage","gate_logs_by_stage"):
-        sd = hooks_data.get(k, None)
-        if isinstance(sd, dict) and sd:
-            for stage in ("S","M","D"):
-                a = sd.get(stage) or sd.get(stage.lower())
-                if a is None:
-                    continue
-                aa = np.asarray(a, float)
-                aa = aa.reshape(aa.shape[0], -1).mean(axis=1)  # (N,*)→(N,)
-                st[stage] = aa
-            break
-
-    # 2) 없으면 원래 경로: gate_outputs → stage split
-    if not st:
-        gates = _collect_gate_arrays_from_hooks(hooks_data)
-        if gates is None:
-            return
-        st = _stage_split_mean_per_sample(np.asarray(gates, float))  # {'S':(N,), 'M':(N,), 'D':(N,)}
-
+    # --- stage-wise TOD aggregation
     rows: List[Dict[str,Any]] = []
     amp: Dict[str, float] = {"S": np.nan, "M": np.nan, "D": np.nan}
-    covered = np.zeros(T, dtype=bool)  # 어떤 stage든 sample이 존재한 TOD bin
+    covered = np.zeros(T, dtype=bool)
 
     def _amp_fn(x: np.ndarray) -> float:
         x = np.asarray(x, float)
         x = x[np.isfinite(x)]
         if x.size == 0:
             return np.nan
-        return float(np.nanstd(x) if amp_method == "std"
-                     else (np.nanmax(x) - np.nanmin(x)))
+        if amp_method == "std":
+            return float(np.nanstd(x))
+        return float(np.nanmax(x) - np.nanmin(x))
 
-    # 3) stage별 TOD 집계
     for stage in ("S","M","D"):
         v = np.asarray(st.get(stage), float)
         if v.size == 0:
             continue
-        bins: List[List[float]] = [[] for _ in range(T)]
-        msk = np.isfinite(v)
         N = min(v.shape[0], idx.shape[0])
+        if N <= 0:
+            continue
+        v = v[:N]; b = idx[:N]
+        msk = np.isfinite(v)
+        bins: List[List[float]] = [[] for _ in range(T)]
         for i in range(N):
             if not msk[i]:
                 continue
-            j = int(idx[i])
+            j = int(b[i])
             bins[j].append(float(v[i]))
 
-        means = [float(np.mean(b)) if len(b) > 0 else np.nan for b in bins]
-        counts = [int(len(b)) for b in bins]
+        means = [float(np.mean(bucket)) if len(bucket) > 0 else np.nan for bucket in bins]
+        counts = [int(len(bucket)) for bucket in bins]
 
-        # detail: 빈 bin도 NaN + sample_count로 기록
         for t in range(T):
             if counts[t] > 0:
                 covered[t] = True
@@ -209,30 +259,35 @@ def compute_and_save_w3_gate_tod_heatmap(
                 "sample_count": counts[t],
             })
 
-        # amp
         finite_means = [m for m in means if np.isfinite(m)]
         amp[stage] = _amp_fn(np.array(finite_means, float)) if finite_means else np.nan
 
-    # 4) summary
+    # --- write detail (append+dedupe)
+    det_csv = Path(out_dir) / "gate_tod_heatmap_detail.csv"
+    _append_or_update_rows(
+        det_csv,
+        rows,
+        subset_keys=_W3_KEYS + ["tod","stage"]
+    )
+
+    # --- write summary
     valid_bins = int(covered.sum())
+    total_bins = int(T)
     summary_row = {
         **{k: ctx[k] for k in _W3_KEYS if k in ctx},
-        "tod_bins": int(T),
-        "tod_amp_s": amp.get("S", np.nan),
-        "tod_amp_m": amp.get("M", np.nan),
-        "tod_amp_d": amp.get("D", np.nan),
-        "tod_amp_mean": float(np.nanmean([v for v in amp.values() if np.isfinite(v)])) \
-                        if any(np.isfinite(list(amp.values()))) else np.nan,
-        "valid_ratio": float(valid_bins) / float(T),
-        "nan_count": int(T - valid_bins),
-        "amp_method": amp_method,
+        "tod_bins": total_bins,
+        "tod_amp_s": float(amp["S"]) if np.isfinite(amp["S"]) else np.nan,
+        "tod_amp_m": float(amp["M"]) if np.isfinite(amp["M"]) else np.nan,
+        "tod_amp_d": float(amp["D"]) if np.isfinite(amp["D"]) else np.nan,
+        "tod_amp_mean": float(np.nanmean([amp["S"], amp["M"], amp["D"]])) if any(np.isfinite(list(amp.values()))) else np.nan,
+        "valid_ratio": float(valid_bins / total_bins) if total_bins > 0 else 0.0,
+        "nan_count": int((~covered).sum())
     }
-
-    _append_or_update_row(Path(out_dir) / "gate_tod_heatmap_summary.csv",
-                          summary_row, subset_keys=_W3_KEYS)
-    _append_or_update_rows(Path(out_dir) / "gate_tod_heatmap_detail.csv",
-                           rows, subset_keys=_W3_KEYS + ["tod", "stage"])
-
+    _append_or_update_row(
+        Path(out_dir) / "gate_tod_heatmap_summary.csv",
+        summary_row,
+        subset_keys=_W3_KEYS
+    )
 
 # ============================================================
 # 2) Gate distribution (게이트 전역 분포 요약 + 분위수 long)
@@ -295,7 +350,6 @@ def rebuild_w3_forest_summary(
     gate_tod_summary_csv: Optional[str | Path] = None,
     group_keys: Tuple[str, ...] = ("experiment_type","dataset","horizon"),
 ) -> None:
-    import pandas as pd, numpy as np
     dpath = Path(detail_csv)
     if not dpath.exists(): return
     df = pd.read_csv(dpath)
@@ -333,8 +387,7 @@ def rebuild_w3_forest_summary(
 
     if out_rows:
         out = pd.DataFrame(out_rows)
-        _atomic_write(out, _ensure_dir(summary_csv))
-
+        _atomic_write_csv(summary_csv, out)
 
 # ============================================================
 # 4) Perturb delta‑bar (원인 지표 Δ)
@@ -347,18 +400,17 @@ def rebuild_w3_perturb_delta_bar(
     summary_csv: str | Path,
     filter_dataset: Optional[str] = None,
 ) -> None:
-    import pandas as pd, numpy as np
     rpath = Path(results_csv)
 
     # 헤더만이라도 보장 생성하는 헬퍼
     def _emit_empties():
-        _atomic_write(
-            pd.DataFrame(columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"]),
-            _ensure_dir(detail_csv)
+        _atomic_write_csv(
+            detail_csv,
+            pd.DataFrame(columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"])
         )
-        _atomic_write(
-            pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"]),
-            _ensure_dir(summary_csv)
+        _atomic_write_csv(
+            summary_csv,
+            pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"])
         )
 
     if not rpath.exists():
@@ -427,11 +479,147 @@ def rebuild_w3_perturb_delta_bar(
     D = pd.DataFrame(detail_rows) if detail_rows else pd.DataFrame(
         columns=["experiment_type","dataset","horizon","seed","perturbation","metric","delta"]
     )
-    _atomic_write(D, _ensure_dir(detail_csv))
+    _atomic_write_csv(detail_csv, D)
 
     if not D.empty:
         S = (D.groupby(["experiment_type","dataset","horizon","perturbation","metric"], as_index=False)
                .agg(delta_mean=("delta","mean"), n=("delta","size")))
     else:
         S = pd.DataFrame(columns=["experiment_type","dataset","horizon","perturbation","metric","delta_mean","n"])
-    _atomic_write(S, _ensure_dir(summary_csv))
+    _atomic_write_csv(summary_csv, S)
+
+# ============================================================
+# 5) Window errors (창 오차 집계)
+# ============================================================
+def save_w3_window_errors_detail(ctx, base_errors, pert_errors, perturbation, out_root="results"):
+    """
+    W3 window-wise errors 저장(요구사항 (4)/(4-1)):
+      - per-(dataset/horizon/seed) 분할 CSV: window_errors_detail_H{h}_S{seed}.csv
+      - 요약 CSV(window_errors_summary.csv) 갱신(중복-업데이트)
+      - 전체 합본 Parquet(W3_window_errors_all.parquet) 통합(메모리 안전)
+    - 모든 라벨은 RMSE가 아니라 'MSE'로 저장 (실제 값은 mean squared error)
+    """
+    dataset = str(ctx.get("dataset", ""))
+    horizon = int(ctx.get("horizon", 96))
+    seed = int(ctx.get("seed", 0))
+    model_tag = str(ctx.get("model_tag", "CTSF"))
+    exp_type = str(ctx.get("experiment_type", "W3"))
+    run_tag = str(ctx.get("run_tag", f"{dataset}-h{horizon}-s{seed}-{exp_type}-{perturbation}"))
+
+    base_errors = np.asarray(base_errors, dtype=np.float64)
+    pert_errors = np.asarray(pert_errors, dtype=np.float64)
+
+    # 출력 디렉토리
+    base_dir = Path(out_root) / f"results_{exp_type}" / dataset / "window_errors"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) per-run detail CSV (wide; mse_base, mse_pert)
+    n = int(min(len(base_errors), len(pert_errors)))
+    df = pd.DataFrame({
+        "experiment_type": [exp_type] * n,
+        "dataset": [dataset] * n,
+        "horizon": np.full(n, horizon, dtype=np.int32),
+        "seed": np.full(n, seed, dtype=np.int32),
+        "model_tag": [model_tag] * n,
+        "perturbation": [str(perturbation)] * n,
+        "run_tag": [run_tag] * n,
+        "window_index": np.arange(n, dtype=np.int32),
+        "mse_base": base_errors[:n].astype("float32"),
+        "mse_perturb": pert_errors[:n].astype("float32"),
+    })
+    detail_path = base_dir / f"window_errors_detail_H{horizon}_S{seed}.csv"
+    _atomic_write_csv(detail_path, df)
+
+    # 2) summary CSV (중복-업데이트)
+    summary_row = {
+        "experiment_type": exp_type,
+        "dataset": dataset,
+        "horizon": horizon,
+        "seed": seed,
+        "perturbation": str(perturbation),
+        "run_tag": run_tag,
+        "n_windows": int(n),
+        "window_mse_median_base": float(np.nanmedian(base_errors[:n])) if n > 0 else np.nan,
+        "window_mse_p90_base": float(np.nanpercentile(base_errors[:n], 90)) if n > 0 else np.nan,
+        "window_mse_median_perturb": float(np.nanmedian(pert_errors[:n])) if n > 0 else np.nan,
+        "window_mse_p90_perturb": float(np.nanpercentile(pert_errors[:n], 90)) if n > 0 else np.nan,
+        "rank_preservation_rate": float(np.mean((pert_errors[:n] > base_errors[:n]).astype(np.float32))) if n > 0 else np.nan,
+    }
+    summ_path = base_dir / "window_errors_summary.csv"
+    _append_or_update_row(summ_path, summary_row,
+                          subset_keys=["experiment_type", "dataset", "horizon", "seed", "perturbation", "run_tag"])
+
+    # 3) 전량 Parquet 통합 (메모리 안전; CSV → Arrow Table 순차 변환)
+    try:
+        consolidate_window_errors_parquet(results_root=str(out_root), exp_type=exp_type)
+    except Exception as _e:
+        print(f"[W3] Parquet 통합 경고: {_e}")
+
+def consolidate_window_errors_parquet(results_root="results", exp_type="W3"):
+    """
+    모든 per-run detail CSV를 하나의 Parquet로 통합 (스키마/압축 지정, 파일 단위 스트리밍).
+    - 메모리에 모든 데이터를 한 번에 올리지 않는다.
+    - 스키마: (dataset:str, horizon:int16, seed:int16, mode/perturbation:str, window_index:int32, mse_base:float32, mse_perturb:float32)
+    결과: {results_root}/results_{exp_type}/W3_window_errors_all.parquet
+    """
+    results_dir = Path(results_root) / f"results_{exp_type}"
+    out_path = results_dir / "W3_window_errors_all.parquet"
+    schema = pa.schema([
+        ("experiment_type", pa.string()),
+        ("dataset", pa.string()),
+        ("horizon", pa.int16()),
+        ("seed", pa.int16()),
+        ("model_tag", pa.string()),
+        ("perturbation", pa.string()),
+        ("run_tag", pa.string()),
+        ("window_index", pa.int32()),
+        ("mse_base", pa.float32()),
+        ("mse_perturb", pa.float32()),
+    ])
+
+    writer = None
+    try:
+        for dataset_dir in results_dir.iterdir():
+            if not dataset_dir.is_dir():
+                continue
+            wnd_dir = dataset_dir / "window_errors"
+            if not wnd_dir.exists():
+                continue
+            for csv_file in sorted(wnd_dir.glob("window_errors_detail_H*_S*.csv")):
+                # Arrow CSV reader (스트리밍)
+                try:
+                    table = pa.csv.read_csv(
+                        csv_file,
+                        read_options=pa.csv.ReadOptions(use_threads=True, block_size=1 << 20),
+                    )
+                    # 필요 열만 캐스팅/보정
+                    keep_cols = [f.name for f in schema]
+                    # 누락 칼럼 보정
+                    for name in keep_cols:
+                        if name not in table.column_names:
+                            # 빈 칼럼 추가
+                            table = table.append_column(name, pa.array([None] * table.num_rows, type=schema.field(name).type))
+                    # 순서/캐스팅
+                    table = table.select(keep_cols).cast(schema)
+                except Exception:
+                    # pandas 경유 fallback
+                    df = pd.read_csv(csv_file, dtype={
+                        "experiment_type": "string",
+                        "dataset": "string",
+                        "horizon": "Int16",
+                        "seed": "Int16",
+                        "model_tag": "string",
+                        "perturbation": "string",
+                        "run_tag": "string",
+                        "window_index": "Int32",
+                        "mse_base": "float32",
+                        "mse_perturb": "float32",
+                    })
+                    table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, schema, compression="snappy")
+                writer.write_table(table)
+    finally:
+        if writer is not None:
+            writer.close()

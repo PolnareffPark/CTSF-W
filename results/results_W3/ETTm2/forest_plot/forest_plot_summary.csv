@@ -1,3 +1,0 @@
-experiment_type,dataset,horizon,perturbation,n_pairs,delta_rmse_mean,delta_rmse_pct_mean,delta_mae_mean,delta_tod_mean
-W3,ETTm2,96,tod_shift,1,0.004573899470647902,0.15441343408932773,0.002847433090210183,
-W3,ETTm2,96,smooth,1,0.0012447481361110846,0.04202231280041146,0.0013862848281860352,

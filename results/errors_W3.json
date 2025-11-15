@@ -1,0 +1,12 @@
+[
+  {
+    "timestamp": "2025-11-15T17:02:38.190564",
+    "experiment_type": "W3",
+    "dataset": "ETTm2",
+    "horizon": 96,
+    "seed": 42,
+    "mode": "none",
+    "error_message": "'W3Experiment' object has no attribute '_evaluate_test_with_baseline_and_perturbed'",
+    "error_traceback": "Traceback (most recent call last):\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/run_suite.py\", line 216, in run_experiment_suite\n    exp.run()\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/w3_experiment.py\", line 820, in run\n    direct = self.evaluate_test()\n             ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/himchan/proj/CTSF/CTSF-W-2/experiments/w3_experiment.py\", line 578, in evaluate_test\n    baseline_direct, current_direct = self._evaluate_test_with_baseline_and_perturbed()\n                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAttributeError: 'W3Experiment' object has no attribute '_evaluate_test_with_baseline_and_perturbed'\n"
+  }
+]
